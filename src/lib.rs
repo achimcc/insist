@@ -1,6 +1,7 @@
 //! insist keeps alerts open and escalating until a human acknowledges them.
 pub mod alertmanager;
 pub mod config;
+pub mod engine;
 pub mod instance;
 pub mod ladder;
 pub mod mac;
