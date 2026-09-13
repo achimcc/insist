@@ -1,0 +1,28 @@
+[
+  {
+    "annotations": {
+      "summary": "Unit lan6-set.service auf server ist rot"
+    },
+    "endsAt": "2026-09-13T12:36:04.000Z",
+    "fingerprint": "7a88909089730720",
+    "receivers": [
+      {
+        "name": "rec"
+      }
+    ],
+    "startsAt": "2026-09-13T12:36:04.000Z",
+    "status": {
+      "inhibitedBy": [],
+      "mutedBy": [],
+      "silencedBy": [],
+      "state": "active"
+    },
+    "updatedAt": "2026-09-13T14:26:04.579+02:00",
+    "labels": {
+      "alertname": "UnitFehlgeschlagen",
+      "instance": "server",
+      "name": "lan6-set.service",
+      "severity": "critical"
+    }
+  }
+]
