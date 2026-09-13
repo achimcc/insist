@@ -1,15 +1,6 @@
 //! What a notification says. Ported from the homeserver's alarm-uebersetzer.
 use crate::alertmanager::Labels;
-use crate::config::Texts;
 use jiff::{tz::TimeZone, Timestamp};
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Rendered {
-    pub title: String,
-    pub message: String,
-    pub priority: u8,
-    pub tags: Vec<String>,
-}
 
 pub fn alertname(labels: &Labels) -> String {
     labels
@@ -35,59 +26,12 @@ pub fn clock(at: Timestamp, tz: &TimeZone) -> String {
     at.to_zoned(tz.clone()).strftime("%H:%M").to_string()
 }
 
-pub fn render_alert(
-    labels: &Labels,
-    annotations: &Labels,
-    starts_at: Timestamp,
-    resolved: bool,
-    texts: &Texts,
-    tz: &TimeZone,
-) -> Rendered {
-    let name = alertname(labels);
-    if resolved {
-        return Rendered {
-            title: format!("{}: {name}", texts.resolved),
-            message: summary(labels, annotations),
-            priority: 2,
-            tags: vec!["white_check_mark".into()],
-        };
-    }
-    let critical = labels.get("severity").map(String::as_str) == Some("critical");
-    Rendered {
-        title: name,
-        message: format!(
-            "{} ({} {})",
-            summary(labels, annotations),
-            texts.since,
-            clock(starts_at, tz)
-        ),
-        priority: if critical { 5 } else { 4 },
-        tags: vec![if critical {
-            "rotating_light"
-        } else {
-            "warning"
-        }
-        .into()],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alertmanager::WebhookMessage;
-    use crate::config::Texts;
 
     fn berlin() -> jiff::tz::TimeZone {
         jiff::tz::TimeZone::get("Europe/Berlin").unwrap()
-    }
-
-    fn single() -> WebhookMessage {
-        let raw = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/fixtures/alertmanager-0.31.1/webhook-firing-single.json"
-        ))
-        .unwrap();
-        serde_json::from_str(&raw).unwrap()
     }
 
     #[test]
@@ -101,70 +45,6 @@ mod tests {
         // Winter time (UTC+1): 2026-12-01T12:36:04Z → 13:36 Berlin
         let winter = jiff::Timestamp::from_second(1796128564).unwrap();
         assert_eq!(clock(winter, &tz), "13:36");
-    }
-
-    #[test]
-    fn a_critical_alert_is_urgent_and_says_what_and_since_when() {
-        let a = &single().alerts[0];
-        let r = render_alert(
-            &a.labels,
-            &a.annotations,
-            a.starts_at,
-            false,
-            &Texts::default(),
-            &berlin(),
-        );
-        assert_eq!(r.title, "UnitFehlgeschlagen");
-        assert_eq!(r.priority, 5);
-        assert_eq!(r.tags, vec!["rotating_light".to_string()]);
-        assert!(
-            r.message
-                .starts_with("Unit lan6-set.service auf server ist rot"),
-            "{}",
-            r.message
-        );
-        // The fixture's startsAt is 2026-09-13T12:36:04Z, which is 14:36 in Berlin (UTC+2)
-        assert!(
-            r.message.contains("(since 14:36)"),
-            "message should contain the local Berlin time: {}",
-            r.message
-        );
-    }
-
-    #[test]
-    fn without_severity_it_is_a_warning_and_keeps_umlauts() {
-        let raw = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/fixtures/alertmanager-0.31.1/webhook-no-severity.json"
-        ))
-        .unwrap();
-        let m: WebhookMessage = serde_json::from_str(&raw).unwrap();
-        let a = &m.alerts[0];
-        let r = render_alert(
-            &a.labels,
-            &a.annotations,
-            a.starts_at,
-            false,
-            &Texts::default(),
-            &berlin(),
-        );
-        assert_eq!(r.priority, 4);
-        assert!(r.message.contains("Prüfung — ä"));
-    }
-
-    #[test]
-    fn a_resolved_alert_is_low_and_prefixed() {
-        let a = &single().alerts[0];
-        let r = render_alert(
-            &a.labels,
-            &a.annotations,
-            a.starts_at,
-            true,
-            &Texts::default(),
-            &berlin(),
-        );
-        assert_eq!(r.title, "Resolved: UnitFehlgeschlagen");
-        assert_eq!(r.priority, 2);
     }
 
     #[test]

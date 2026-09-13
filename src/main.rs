@@ -1,10 +1,12 @@
 use anyhow::Result;
 use insist::config::Config;
-use insist::ntfy::NtfyClient;
+use insist::runtime::{system_clock, Runtime};
 use insist::secret::Secret;
 use insist::secrets::Secrets;
-use insist::server::{router_stage0, Stage0};
+use insist::server::{router, Shared};
+use insist::state::State;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,25 +21,85 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "/etc/insist.toml".into());
     let config = Config::load(std::path::Path::new(&path))?;
-    // Read once at start: a service that learns at the first alert that it
-    // cannot send fails exactly when it is needed.
     let secrets = Secrets::read(&config.secrets_file)?;
-    let tz = config.tz()?;
-    let ntfy = NtfyClient::new(
+    let loaded = State::load(&config.state_file, jiff::Timestamp::now())?;
+    let ack_topic = Secret::from(format!(
+        "{}{}",
+        secrets.topic.expose(),
+        config.ack_topic_suffix
+    ));
+    let (reconcile, tick) = (config.reconcile_secs, config.tick_secs);
+    // Built before the runtime takes config and secrets. Taking the runtime
+    // lock three times inside one expression would deadlock on the second.
+    let ack_client = insist::ntfy::NtfyClient::new(
         &config.ntfy_url,
         Secret::from(secrets.token.expose().to_string()),
     )?;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    tracing::info!("listening on {}", config.listen);
-    axum::serve(
-        listener,
-        router_stage0(Arc::new(Stage0 {
-            config,
-            secrets,
-            ntfy,
-            tz,
-        })),
-    )
-    .await?;
+    let shared: Shared = Arc::new(tokio::sync::Mutex::new(Runtime::new(
+        config,
+        secrets,
+        loaded,
+        system_clock(),
+    )?));
+
+    // First reconciliation before READY: whatever fired while insist was down
+    // is announced now, not a minute later.
+    shared.lock().await.reconcile_once().await;
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+
+    let s = shared.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(reconcile));
+        loop {
+            every.tick().await;
+            s.lock().await.reconcile_once().await;
+        }
+    });
+
+    let s = shared.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(tick));
+        loop {
+            every.tick().await;
+            s.lock().await.tick_once().await;
+            // Only from here: a watchdog ping proves the loop runs AND the
+            // lock is not stuck, which a separate timer task would not.
+            let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
+        }
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let s = shared.clone();
+    tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            s.lock().await.acknowledge(line).await;
+        }
+    });
+    let s = shared.clone();
+    tokio::spawn(async move {
+        let mut backoff = 1u64;
+        loop {
+            let since = s.lock().await.engine.state().ack_cursor.clone();
+            let result = ack_client
+                .read_acks(&ack_topic, since.as_deref(), Duration::from_secs(120), &tx)
+                .await;
+            match result {
+                Ok(()) => backoff = 1,
+                Err(e) => {
+                    tracing::error!("acknowledgement stream: {e}; reconnecting in {backoff} s");
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
+                }
+            }
+        }
+    });
+
+    tracing::info!("listening");
+    axum::serve(listener, router(shared))
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
     Ok(())
 }
