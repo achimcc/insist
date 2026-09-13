@@ -3,10 +3,11 @@ use insist::config::Config;
 use insist::runtime::{system_clock, Runtime};
 use insist::secret::Secret;
 use insist::secrets::Secrets;
-use insist::server::{router, Shared};
+use insist::server::{router, App, Shared};
 use insist::state::State;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::MissedTickBehavior;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,12 +37,9 @@ async fn main() -> Result<()> {
         Secret::from(secrets.token.expose().to_string()),
     )?;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    let shared: Shared = Arc::new(tokio::sync::Mutex::new(Runtime::new(
-        config,
-        secrets,
-        loaded,
-        system_clock(),
-    )?));
+    let runtime = Runtime::new(config, secrets, loaded, system_clock())?;
+    let metrics = runtime.metrics_handle();
+    let shared: Shared = Arc::new(tokio::sync::Mutex::new(runtime));
 
     // First reconciliation before READY: whatever fired while insist was down
     // is announced now, not a minute later.
@@ -51,6 +49,10 @@ async fn main() -> Result<()> {
     let s = shared.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(reconcile));
+        // A pass bounded by a hanging ntfy can still run long; catching up
+        // with a burst of immediate ticks afterwards would only make the
+        // next pass worse. Delay just resumes on the next regular boundary.
+        every.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             every.tick().await;
             s.lock().await.reconcile_once().await;
@@ -60,6 +62,7 @@ async fn main() -> Result<()> {
     let s = shared.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(tick));
+        every.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             every.tick().await;
             s.lock().await.tick_once().await;
@@ -96,10 +99,16 @@ async fn main() -> Result<()> {
     });
 
     tracing::info!("listening");
-    axum::serve(listener, router(shared))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router(App {
+            runtime: shared,
+            metrics,
+        }),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }
