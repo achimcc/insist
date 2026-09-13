@@ -273,15 +273,16 @@ mod tests {
     fn a_warning_due_at_21_59_goes_out_and_one_due_at_22_00_waits() {
         let l = warning();
         let start = ts("2026-09-11T15:59:00Z"); // 17:59 local, step 1 due at 21:59
-        assert!(due(
+        let at_21_59 = due(
             &l,
             start,
             &p(Some(0), Some("2026-09-11T15:59:00Z")),
             ts("2026-09-11T19:59:00Z"),
             &night(),
-            &berlin()
+            &berlin(),
         )
-        .is_some());
+        .unwrap();
+        assert_eq!((at_21_59.step, at_21_59.priority), (1, 4));
         let start = ts("2026-09-11T16:00:00Z"); // step 1 due at 22:00 local
         assert!(due(
             &l,
@@ -301,7 +302,8 @@ mod tests {
         assert!(n.contains(ts("2026-10-25T01:30:00Z"), &berlin())); // 02:30 CET
         assert!(n.contains(ts("2026-10-25T05:59:00Z"), &berlin())); // 06:59 CET
         assert!(!n.contains(ts("2026-10-25T06:00:00Z"), &berlin())); // 07:00 CET
-                                                                     // The day before, UTC+2.
+
+        // The day before, UTC+2.
         assert!(n.contains(ts("2026-10-24T04:59:00Z"), &berlin())); // 06:59 CEST
         assert!(!n.contains(ts("2026-10-24T05:00:00Z"), &berlin())); // 07:00 CEST
         assert!(n.contains(ts("2026-10-24T20:00:00Z"), &berlin())); // 22:00 CEST

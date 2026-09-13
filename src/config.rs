@@ -83,6 +83,11 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         use anyhow::bail;
+        for name in ["critical", "warning", "probe"] {
+            if !self.ladders.contains_key(name) {
+                bail!("the required ladder {name} is missing");
+            }
+        }
         for (name, ladder) in &self.ladders {
             let Some(first) = ladder.steps.first() else {
                 bail!("ladder {name} has no steps")
@@ -213,5 +218,33 @@ pub(crate) mod tests {
     fn a_zero_repeat_is_an_error() {
         let bad = MINIMAL.replace("repeat_secs = 60,", "repeat_secs = 0,");
         assert!(Config::from_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn each_of_the_three_required_ladders_is_mandatory() {
+        let removals: &[(&str, &str)] = &[
+            (
+                "critical",
+                "[ladders.critical]\nsteps = [\n  { after_secs = 0, priority = 4 },\n  { after_secs = 900, repeat_secs = 900, priority = 5 },\n  { after_secs = 3600, repeat_secs = 300, priority = 5, raise_unacknowledged = true },\n]\n\n",
+            ),
+            (
+                "warning",
+                "[ladders.warning]\nquiet_at_night = true\nsteps = [\n  { after_secs = 0, priority = 3 },\n  { after_secs = 14400, repeat_secs = 43200, priority = 4 },\n]\n\n",
+            ),
+            (
+                "probe",
+                "[ladders.probe]\nsteps = [\n  { after_secs = 0, priority = 4 },\n  { after_secs = 60, repeat_secs = 60, priority = 5 },\n]\n",
+            ),
+        ];
+        for (name, block) in removals {
+            assert!(
+                MINIMAL.contains(block),
+                "fixture no longer contains the {name} block verbatim"
+            );
+            let bad = MINIMAL.replace(block, "");
+            assert_ne!(&bad, MINIMAL, "removing {name} did not change the fixture");
+            let err = Config::from_toml(&bad).unwrap_err().to_string();
+            assert!(err.contains(name), "{err}");
+        }
     }
 }
