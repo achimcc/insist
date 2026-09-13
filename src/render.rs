@@ -91,6 +91,19 @@ mod tests {
     }
 
     #[test]
+    fn clock_converts_to_local_time_with_dst() {
+        let tz = berlin();
+
+        // Summer time (UTC+2): 2026-09-13T12:36:04Z → 14:36 Berlin
+        let summer = jiff::Timestamp::from_second(1789302964).unwrap();
+        assert_eq!(clock(summer, &tz), "14:36");
+
+        // Winter time (UTC+1): 2026-12-01T12:36:04Z → 13:36 Berlin
+        let winter = jiff::Timestamp::from_second(1796128564).unwrap();
+        assert_eq!(clock(winter, &tz), "13:36");
+    }
+
+    #[test]
     fn a_critical_alert_is_urgent_and_says_what_and_since_when() {
         let a = &single().alerts[0];
         let r = render_alert(
@@ -110,7 +123,12 @@ mod tests {
             "{}",
             r.message
         );
-        assert!(r.message.contains("since "), "{}", r.message);
+        // The fixture's startsAt is 2026-09-13T12:36:04Z, which is 14:36 in Berlin (UTC+2)
+        assert!(
+            r.message.contains("(since 14:36)"),
+            "message should contain the local Berlin time: {}",
+            r.message
+        );
     }
 
     #[test]
