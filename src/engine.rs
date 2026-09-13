@@ -18,7 +18,10 @@ pub const OWN_LABEL: &str = "insist";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
-    Step(usize),
+    /// The step index and whether this send is the night substitute (see
+    /// `ladder::Due::quiet`) — carried explicitly so `confirm` can record it
+    /// on the instance without re-deriving it from the priority number.
+    Step(usize, bool),
     Acknowledged,
     Resolved,
     Once,
@@ -157,6 +160,7 @@ impl Engine {
                 resolved_at: None,
                 suppressed: false,
                 unacknowledged_raised: false,
+                last_quiet: false,
             });
         if let Some(e) = ends_at {
             instance.ends_at = Some(e);
@@ -298,6 +302,7 @@ impl Engine {
             let progress = Progress {
                 last_step: instance.last_step,
                 last_sent: instance.last_sent,
+                quiet: instance.last_quiet,
             };
             if let Some(due) = ladder::due(
                 ladder,
@@ -325,7 +330,7 @@ impl Engine {
         let loud = i.ladder == "critical" || i.probe;
         Outgoing {
             id: Some(id.clone()),
-            kind: Kind::Step(due.step),
+            kind: Kind::Step(due.step, due.quiet),
             probe: i.probe,
             title: i.alertname.clone(),
             message: format!(
@@ -382,10 +387,11 @@ impl Engine {
                     i.acknowledgement_sent = true;
                 }
             }
-            Kind::Step(step) => {
+            Kind::Step(step, quiet) => {
                 if let Some(i) = self.state.instances.get_mut(id) {
                     i.last_step = Some(step);
                     i.last_sent = Some(now);
+                    i.last_quiet = quiet;
                 }
             }
             Kind::Once => {}
@@ -464,7 +470,7 @@ mod tests {
         let fx = e.on_webhook(&w, t0);
         assert_eq!(fx.publish.len(), 1);
         let first = &fx.publish[0];
-        assert_eq!(first.kind, Kind::Step(0));
+        assert_eq!(first.kind, Kind::Step(0, false));
         assert_eq!(first.priority, 4);
         assert_eq!(first.title, "UnitFehlgeschlagen");
         let body = first.button.clone().expect("a button");
@@ -479,18 +485,18 @@ mod tests {
         let fx = e.tick(plus(t0, 900));
         assert_eq!(
             (fx.publish[0].kind.clone(), fx.publish[0].priority),
-            (Kind::Step(1), 5)
+            (Kind::Step(1, false), 5)
         );
         send_all(&mut e, &fx, plus(t0, 900));
 
         let fx = e.tick(plus(t0, 3600));
-        assert_eq!(fx.publish[0].kind, Kind::Step(2));
+        assert_eq!(fx.publish[0].kind, Kind::Step(2, false));
         assert_eq!(fx.raise.len(), 1);
         assert_eq!(fx.raise[0].minutes, 60);
         send_all(&mut e, &fx, plus(t0, 3600));
 
         let fx = e.tick(plus(t0, 3900));
-        assert_eq!(fx.publish[0].kind, Kind::Step(2));
+        assert_eq!(fx.publish[0].kind, Kind::Step(2, false));
         assert!(
             fx.raise.is_empty(),
             "the unacknowledged mail is raised once"
@@ -551,7 +557,7 @@ mod tests {
         assert!(matches!(e.on_ack(&stranger, t0), AckOutcome::Unknown(_)));
         assert_eq!(
             e.tick(plus(t0, 900)).publish[0].kind,
-            Kind::Step(1),
+            Kind::Step(1, false),
             "still escalating"
         );
     }
@@ -592,7 +598,7 @@ mod tests {
             serde_json::from_str(&recorded("api-active.json")).unwrap();
         let t0 = active[0].starts_at;
         let fx = e.on_reconcile(&active, t0, t0);
-        assert!(fx.publish.iter().any(|o| o.kind == Kind::Step(0)));
+        assert!(fx.publish.iter().any(|o| o.kind == Kind::Step(0, false)));
 
         let mut e = engine();
         let suppressed: Vec<GettableAlert> =
@@ -647,7 +653,7 @@ mod tests {
             .expect("the unsilenced alert escalates");
         assert_eq!(
             step.kind,
-            Kind::Step(2),
+            Kind::Step(2, false),
             "it climbs straight to the step its age deserves, not step 0"
         );
     }
@@ -722,7 +728,7 @@ mod tests {
         active[0].ends_at = future_ends;
 
         let fx = e.on_reconcile(&active, t0, t0);
-        assert_eq!(fx.publish[0].kind, Kind::Step(0));
+        assert_eq!(fx.publish[0].kind, Kind::Step(0, false));
         send_all(&mut e, &fx, t0);
 
         // Alertmanager's storage is memory-only: an empty answer after a
@@ -735,7 +741,7 @@ mod tests {
         // Listed again before endsAt: same instance, ladder not restarted.
         let fx = e.on_reconcile(&active, plus(t0, 3600), plus(t0, 3600));
         assert!(
-            !fx.publish.iter().any(|o| o.kind == Kind::Step(0)),
+            !fx.publish.iter().any(|o| o.kind == Kind::Step(0, false)),
             "the ladder must not restart: {fx:?}"
         );
         assert_eq!(e.open_instances(), 1);
@@ -853,6 +859,58 @@ mod tests {
         assert!(
             fx.raise.is_empty(),
             "acknowledged instances never raise the unacknowledged mail"
+        );
+    }
+
+    #[test]
+    fn a_warning_seen_at_night_is_repeated_loudly_when_the_night_ends() {
+        // Owner decision 2026-09-13: the quiet night substitute is deferred,
+        // not skipped — the loud notice it stood in for is still owed the
+        // moment the night ends, even though this instance is far too young
+        // (2 h old) for step 1 to be due on its own.
+        let mut e = engine();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&recorded("webhook-firing-single.json")).unwrap();
+        v["alerts"][0]["labels"]["severity"] = "warning".into();
+        v["alerts"][0]["startsAt"] = "2026-09-12T03:00:00Z".into(); // 05:00 local (CEST)
+        let w: WebhookMessage = serde_json::from_value(v).unwrap();
+        let t0 = w.alerts[0].starts_at;
+
+        let fx = e.on_webhook(&w, t0);
+        assert_eq!(fx.publish.len(), 1);
+        assert_eq!(
+            (fx.publish[0].kind.clone(), fx.publish[0].priority),
+            (Kind::Step(0, true), 2),
+            "the first notice at night goes out quietly"
+        );
+        let id = fx.publish[0].id.clone().unwrap();
+        send_all(&mut e, &fx, t0);
+        assert!(
+            e.state().instances.get(&id).unwrap().last_quiet,
+            "confirm records that the send was the quiet substitute"
+        );
+
+        assert!(
+            e.tick(plus(t0, 7140)).publish.is_empty(),
+            "06:59 local: still night, no second quiet send"
+        );
+
+        let fx = e.tick(plus(t0, 7200));
+        assert_eq!(fx.publish.len(), 1);
+        assert_eq!(
+            (fx.publish[0].kind.clone(), fx.publish[0].priority),
+            (Kind::Step(0, false), 3),
+            "07:00 local: the deferred loud notice goes out, still step 0"
+        );
+        send_all(&mut e, &fx, plus(t0, 7200));
+        assert!(
+            !e.state().instances.get(&id).unwrap().last_quiet,
+            "confirm clears the quiet flag on the loud send"
+        );
+
+        assert!(
+            e.tick(plus(t0, 7500)).publish.is_empty(),
+            "07:05 local: the loud repeat was just sent, nothing new due"
         );
     }
 }

@@ -34,6 +34,13 @@ pub struct Instance {
     pub resolved_at: Option<Timestamp>,
     pub suppressed: bool,
     pub unacknowledged_raised: bool,
+    /// Whether the last confirmed send was the night substitute (see
+    /// `ladder::Progress::quiet`) — so the next tick after the night ends
+    /// knows the loud step it stood in for is still owed. `#[serde(default)]`:
+    /// a state file written before this field existed must still load, as
+    /// "not quiet" (the safe reading: nothing owed beyond the normal ladder).
+    #[serde(default)]
+    pub last_quiet: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -131,6 +138,7 @@ mod tests {
                 resolved_at: None,
                 suppressed: false,
                 unacknowledged_raised: false,
+                last_quiet: false,
             },
         );
         s.ack_cursor = Some("hwQ2YpKdmg".into());
@@ -215,5 +223,35 @@ mod tests {
         );
         let instance = loaded.state.instances.values().next().unwrap();
         assert_eq!(instance.ends_at, None);
+    }
+
+    #[test]
+    fn an_old_state_file_without_last_quiet_loads_with_false() {
+        let mut with_field = sample();
+        with_field
+            .instances
+            .get_mut(&InstanceId::parse("0123456789abcdef").unwrap())
+            .unwrap()
+            .last_quiet = true;
+        let mut value = serde_json::to_value(&with_field).unwrap();
+        let removed = value["instances"]["0123456789abcdef"]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_quiet");
+        assert!(
+            removed.is_some(),
+            "last_quiet was not present in the serialised instance"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        let loaded = State::load(&path, now()).unwrap();
+        assert!(
+            loaded.moved_corrupt_to.is_none(),
+            "an old file must not be treated as corrupt"
+        );
+        let instance = loaded.state.instances.values().next().unwrap();
+        assert!(!instance.last_quiet);
     }
 }
