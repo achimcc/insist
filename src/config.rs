@@ -10,9 +10,18 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub listen: SocketAddr,
     pub ntfy_url: String,
+    pub alertmanager_url: String,
+    pub state_file: PathBuf,
     pub secrets_file: PathBuf,
     pub timezone: String,
+    pub ack_topic_suffix: String,
+    pub reconcile_secs: u64,
+    pub tick_secs: u64,
+    pub watchdog_max_age_secs: u64,
+    pub unacknowledged_alertname: String,
     pub probe: ProbeMatch,
+    pub night: crate::ladder::Night,
+    pub ladders: std::collections::BTreeMap<String, crate::ladder::Ladder>,
     #[serde(default)]
     pub texts: Texts,
 }
@@ -63,6 +72,7 @@ impl Config {
         let config: Config = toml::from_str(raw)?;
         // Fail at start, not at the first alert at night.
         config.tz()?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -70,23 +80,69 @@ impl Config {
         jiff::tz::TimeZone::get(&self.timezone)
             .with_context(|| format!("unknown timezone {}", self.timezone))
     }
+
+    fn validate(&self) -> Result<()> {
+        use anyhow::bail;
+        for (name, ladder) in &self.ladders {
+            let Some(first) = ladder.steps.first() else {
+                bail!("ladder {name} has no steps")
+            };
+            if first.after_secs != 0 {
+                bail!("ladder {name} must start at after_secs = 0");
+            }
+            for pair in ladder.steps.windows(2) {
+                if pair[1].after_secs <= pair[0].after_secs {
+                    bail!("ladder {name}: after_secs must climb");
+                }
+            }
+            for step in &ladder.steps {
+                if !(1..=5).contains(&step.priority) {
+                    bail!("ladder {name}: priority must be 1..=5");
+                }
+                if step.repeat_secs == Some(0) {
+                    bail!("ladder {name}: repeat_secs = 0 would send every tick");
+                }
+            }
+        }
+        if !(0..24).contains(&self.night.start_hour) || !(0..24).contains(&self.night.end_hour) {
+            bail!("night hours must be 0..=23");
+        }
+        if self.reconcile_secs == 0 || self.tick_secs == 0 {
+            bail!("reconcile_secs and tick_secs must be positive");
+        }
+        Ok(())
+    }
+
+    /// Which ladder an alert climbs, by name. A probe wins over severity; a
+    /// missing severity is a warning. None: no ladder, send once, keep no state.
+    pub fn ladder_for(
+        &self,
+        labels: &crate::alertmanager::Labels,
+    ) -> Option<(String, &crate::ladder::Ladder)> {
+        let name = if labels.get(&self.probe.label) == Some(&self.probe.value) {
+            "probe".to_string()
+        } else {
+            labels
+                .get("severity")
+                .cloned()
+                .unwrap_or_else(|| "warning".to_string())
+        };
+        self.ladders.get(&name).map(|l| (name, l))
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::Config;
 
-    const MINIMAL: &str = r#"
-listen = "127.0.0.1:9099"
-ntfy_url = "https://ntfy.example"
-secrets_file = "/run/credentials/insist.service/insist-env"
-timezone = "Europe/Berlin"
+    pub(crate) const MINIMAL: &str = include_str!("../fixtures/constructed-config.toml");
 
-[probe]
-label = "insist_probe"
-value = "ja"
-topic_suffix = "-selbstprobe"
-"#;
+    fn labels(pairs: &[(&str, &str)]) -> crate::alertmanager::Labels {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
 
     #[test]
     fn loads_a_minimal_file_with_default_texts() {
@@ -113,5 +169,49 @@ topic_suffix = "-selbstprobe"
     #[test]
     fn an_unknown_key_is_an_error() {
         assert!(Config::from_toml(&format!("{MINIMAL}\nlsiten = 1\n")).is_err());
+    }
+
+    #[test]
+    fn the_ladder_follows_severity_probe_wins_and_missing_severity_is_warning() {
+        let c = Config::from_toml(MINIMAL).unwrap();
+        assert_eq!(
+            c.ladder_for(&labels(&[("severity", "critical")]))
+                .unwrap()
+                .0,
+            "critical"
+        );
+        assert_eq!(c.ladder_for(&labels(&[])).unwrap().0, "warning");
+        assert_eq!(
+            c.ladder_for(&labels(&[("severity", "critical"), ("insist_probe", "ja")]))
+                .unwrap()
+                .0,
+            "probe"
+        );
+        assert!(c.ladder_for(&labels(&[("severity", "info")])).is_none());
+    }
+
+    #[test]
+    fn a_ladder_must_start_at_zero_and_climb() {
+        let bad = MINIMAL.replace(
+            "{ after_secs = 0, priority = 3 }",
+            "{ after_secs = 60, priority = 3 }",
+        );
+        assert!(Config::from_toml(&bad).is_err());
+        let bad = MINIMAL.replace(
+            "{ after_secs = 14400, repeat_secs = 43200, priority = 4 }",
+            "{ after_secs = 0, priority = 4 }",
+        );
+        assert!(Config::from_toml(&bad).is_err());
+        let bad = MINIMAL.replace(
+            "{ after_secs = 60, repeat_secs = 60, priority = 5 }",
+            "{ after_secs = 60, repeat_secs = 60, priority = 9 }",
+        );
+        assert!(Config::from_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn a_zero_repeat_is_an_error() {
+        let bad = MINIMAL.replace("repeat_secs = 60,", "repeat_secs = 0,");
+        assert!(Config::from_toml(&bad).is_err());
     }
 }

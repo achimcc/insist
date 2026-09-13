@@ -23,17 +23,49 @@ async fn app(ntfy: &MockServer) -> axum::Router {
         r#"
 listen = "127.0.0.1:9099"
 ntfy_url = "{}"
-secrets_file = "/nonexistent"
+alertmanager_url = "http://127.0.0.1:9093"
+secrets_file = "/run/credentials/insist.service/insist-env"
+state_file = "/var/lib/insist/state.json"
 timezone = "Europe/Berlin"
+ack_topic_suffix = "-quittung"
+reconcile_secs = 60
+tick_secs = 15
+watchdog_max_age_secs = 300
+unacknowledged_alertname = "AlarmUnquittiert"
+
 [probe]
 label = "insist_probe"
 value = "ja"
 topic_suffix = "-selbstprobe"
+
+[night]
+start_hour = 22
+end_hour = 7
+
+[ladders.critical]
+steps = [
+  {{ after_secs = 0, priority = 4 }},
+  {{ after_secs = 900, repeat_secs = 900, priority = 5 }},
+  {{ after_secs = 3600, repeat_secs = 300, priority = 5, raise_unacknowledged = true }},
+]
+
+[ladders.warning]
+quiet_at_night = true
+steps = [
+  {{ after_secs = 0, priority = 3 }},
+  {{ after_secs = 14400, repeat_secs = 43200, priority = 4 }},
+]
+
+[ladders.probe]
+steps = [
+  {{ after_secs = 0, priority = 4 }},
+  {{ after_secs = 60, repeat_secs = 60, priority = 5 }},
+]
 "#,
         ntfy.uri()
     ))
     .unwrap();
-    let secrets = Secrets::parse("NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=tk_alarm\n").unwrap();
+    let secrets = Secrets::parse("NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=tk_alarm\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=00ff\nWATCHDOG_URL=https://hc.example/ping/geheim\n").unwrap();
     let tz = config.tz().unwrap();
     let client = NtfyClient::new(&config.ntfy_url, Secret::from("tk_alarm".to_string())).unwrap();
     router_stage0(Arc::new(Stage0 {

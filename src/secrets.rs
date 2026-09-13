@@ -11,6 +11,12 @@ pub struct Secrets {
     pub topic: Secret,
     /// The publishing token of the ntfy user `alarm`.
     pub token: Secret,
+    /// The token inside every Acknowledge button. ntfy lets it write to the
+    /// acknowledgement topic and nothing else.
+    pub button_token: Secret,
+    pub ack_key: Secret,
+    /// The external dead man's switch. Its URL is its credential.
+    pub watchdog_url: Secret,
 }
 
 impl Secrets {
@@ -41,6 +47,9 @@ impl Secrets {
         Ok(Secrets {
             topic: take("NTFY_TOPIC")?,
             token: take("NTFY_TOKEN")?,
+            button_token: take("NTFY_BUTTON_TOKEN")?,
+            ack_key: take("ACK_HMAC_KEY")?,
+            watchdog_url: take("WATCHDOG_URL")?,
         })
     }
 }
@@ -49,10 +58,11 @@ impl Secrets {
 mod tests {
     use super::Secrets;
 
+    const FULL: &str = "NTFY_TOPIC=alarme-xyz\nNTFY_TOKEN=tk_abc\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=00ff\nWATCHDOG_URL=https://hc.example/ping/geheim\n";
+
     #[test]
     fn parses_key_value_lines_and_ignores_comments() {
-        let s =
-            Secrets::parse("# comment\nNTFY_TOPIC=alarme-xyz\nNTFY_TOKEN = tk_abc\n\n").unwrap();
+        let s = Secrets::parse(&format!("# comment\n{FULL}")).unwrap();
         assert_eq!(s.topic.expose(), "alarme-xyz");
         assert_eq!(s.token.expose(), "tk_abc");
     }
@@ -68,6 +78,34 @@ mod tests {
 
     #[test]
     fn an_empty_value_counts_as_missing() {
-        assert!(Secrets::parse("NTFY_TOPIC=\nNTFY_TOKEN=tk\n").is_err());
+        assert!(Secrets::parse(&FULL.replace("NTFY_TOPIC=alarme-xyz", "NTFY_TOPIC=")).is_err());
+    }
+
+    #[test]
+    fn parses_all_five_keys() {
+        let s = Secrets::parse(FULL).unwrap();
+        assert_eq!(s.button_token.expose(), "tk_knopf");
+        assert_eq!(s.ack_key.expose(), "00ff");
+        assert_eq!(s.watchdog_url.expose(), "https://hc.example/ping/geheim");
+    }
+
+    #[test]
+    fn each_key_is_required_and_named_without_values() {
+        for key in [
+            "NTFY_TOPIC",
+            "NTFY_TOKEN",
+            "NTFY_BUTTON_TOKEN",
+            "ACK_HMAC_KEY",
+            "WATCHDOG_URL",
+        ] {
+            let without: String = FULL
+                .lines()
+                .filter(|l| !l.starts_with(&format!("{key}=")))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let err = Secrets::parse(&without).unwrap_err().to_string();
+            assert!(err.contains(key), "{err}");
+            assert!(!err.contains("geheim") && !err.contains("tk_"), "{err}");
+        }
     }
 }

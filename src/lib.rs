@@ -2,6 +2,7 @@
 pub mod alertmanager;
 pub mod config;
 pub mod instance;
+pub mod ladder;
 pub mod mac;
 pub mod ntfy;
 pub mod render;
