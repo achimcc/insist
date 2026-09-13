@@ -251,17 +251,41 @@ pkgs.testers.runNixOSTest {
         # The button itself talks straight to ntfy, not to insist: a press
         # can land while insist is down. What is under test is whether the
         # acknowledgement stream resumes from where it left off (its
-        # recorded `since`) once insist comes back, instead of only seeing
-        # presses made while it happened to be listening.
-        machine.systemctl("stop insist.service")
+        # recorded `since=<cursor>`) once insist comes back, instead of
+        # replaying ntfy's whole cache (`since=all`) — which would also
+        # re-deliver the still-wrong-tag forged press from above and reject
+        # it a second time. `machine.systemctl` alone does not check its own
+        # exit code, so the stop is asserted explicitly and confirmed with
+        # `is-active` before the button is pressed while insist is down.
+        machine.succeed("systemctl stop insist.service")
+        machine.fail("systemctl is-active insist.service")
         machine.succeed(f"press {body2}")
-        machine.systemctl("start insist.service")
+        restart_epoch = machine.succeed("date +%s").strip()
+        machine.succeed("systemctl start insist.service")
         machine.wait_for_unit("insist.service")
 
         wait_for(
             "alarmtopic-selbstprobe",
             f'any(.[]; .sequence_id == "{seq2}" and ((.title // "") | startswith("Acknowledged")))',
             60,
+        )
+
+        # since=all would have re-read the old forged press (its tag is
+        # still wrong, so it would be rejected again) and bumped this
+        # counter above zero; since=<cursor> never re-reads it. The counter
+        # is process-local (it restarts at 0), so this is only meaningful
+        # right after the restart above, before anything else can reject.
+        machine.wait_until_succeeds(
+            "curl -s http://127.0.0.1:9099/metrics | grep -qxF 'insist_ack_rejected_total 0'",
+            timeout=10,
+        )
+        # A second replayed message since=all would misread: the real press
+        # for the FIRST probe, already resolved and gone from state by now,
+        # which insist logs as an unknown instance rather than a rejection
+        # (so the counter above cannot see it). Check the journal instead,
+        # scoped to after the restart.
+        machine.fail(
+            f"journalctl -u insist --since=@{restart_epoch} | grep -qi 'unknown instance'"
         )
 
         # Resolve it too, so the state is empty again before the watchdog
@@ -282,5 +306,18 @@ pkgs.testers.runNixOSTest {
         machine.sleep(25)
         code = machine.succeed("curl -s -o /dev/null -w '%{http_code}' -X POST --data '{}' http://127.0.0.1:9099/watchdog").strip()
         assert code == "503", code
+
+    with subtest("the systemd watchdog itself never had to restart insist"):
+        # NRestarts counts only automatic restarts systemd's own Restart=
+        # logic triggered (e.g. a missed WatchdogSec ping aborting the
+        # process); a manual stop+start, like the one above, is not that
+        # and does not increment it (systemd(1) NRestarts: "the number of
+        # times the service has been restarted"; the restart subtest above
+        # used an explicit stop then start, never `systemctl restart` or an
+        # automatic Restart=). Read by NAME=, not by the order of the two
+        # -p flags (systemctl show does not promise to keep that order).
+        show = machine.succeed("systemctl show insist.service -p NRestarts -p WatchdogUSec").splitlines()
+        assert "NRestarts=0" in show, show
+        assert "WatchdogUSec=2min" in show, show
   '';
 }

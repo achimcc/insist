@@ -5,11 +5,10 @@
 On 2026-09-11 a firewall rule silently fell away and stayed off for five
 hours. A watcher noticed and mailed about it every fifteen minutes from
 17:49 to 22:27 — 21 mails, every one delivered, none read — plus one urgent
-push notification at 17:55 that also went unread. The outage was found by a
-human stumbling into it, not by any of the alerts.
+push notification at 17:55 that also went unread.
 
-The alerting was not missing coverage: both paths had seen the fault and
-said so. What was missing was state. An alert has no memory of whether
+The alerting was not missing coverage: it had seen the fault and said so,
+repeatedly. What was missing was state. An alert has no memory of whether
 anyone has looked at it, and nothing makes it louder when nobody has.
 
 ## Shape
@@ -25,7 +24,7 @@ receivers insist is configured to watch: the alerting API also lists alerts
 routed to mail-only receivers, and those must never become instances insist
 notifies about and waits on.
 
-A webhook's group can carry several alerts at once (they share a
+A webhook's group can carry several alerts at once (they share an
 `alertname`, say); insist still sends one notification per instance, not
 one per group, so that each alert's own escalation and acknowledgement stay
 independent of whatever else happened to fire alongside it. The notification
@@ -54,65 +53,122 @@ with an empty list. Treating that emptiness as "everything is resolved"
 would read a restart during a real outage as an all-clear. An instance
 missing from the API is therefore only resolved once its own last known
 end time has actually passed; until then, a gap in reconciliation is read
-as a gap in reconciliation, not as good news.
+as a gap in reconciliation, not as good news. An instance that has never
+had a real end time reported for it — one insist has only ever seen
+through a webhook, which never carries a real one — has no deadline to
+wait for, so its absence resolves it at once; the waiting is specifically
+for instances whose known end time gives a reason not to conclude anything
+yet.
 
 ## Ladders and night
 
 Each severity has its own ladder: a table of steps, each with a delay since
 the alert started, an optional repeat interval, and a priority to send at.
-`critical` escalates until acknowledged; `warning` reminds a few times;
-anything else without a matching ladder falls back to a single, stateless
-notice with no button.
+`critical` and `warning` both escalate until acknowledged, at different
+paces — `critical` goes loud after fifteen minutes and, if still
+unacknowledged after an hour, additionally raises its own alert (see
+below); `warning` stays quiet for four hours, then repeats a loud reminder
+every twelve. Anything without a severity that matches a configured ladder
+— including a missing severity altogether, which is treated as `warning` —
+falls back to a single, stateless notice with no button and no further
+escalation.
 
-A `warning` ladder can be marked quiet at night: its first notice, if due
-during the configured night hours, goes out at low priority instead of
-being held back entirely — deferred, never skipped. When the night ends,
-the step that the alert's age actually deserves by then is sent at full,
-loud priority for that step. An alert is never silently swallowed by the
-clock.
+An instance the alerting system itself reports as suppressed (silenced or
+inhibited) is never escalated by insist for as long as that lasts —
+something a human has deliberately silenced elsewhere is not insist's to
+keep pushing on. Once the suppression ends, the same instance simply
+resumes escalating at whatever step its total age by then already earns,
+not from the beginning.
 
-A `critical` ladder can name one step as the point where an instance is
-raised as its own alert back into the alerting system if it is still
-unacknowledged — the equivalent of the earlier mail that a mounting pile of
-identical reminders eventually gets ignored, sent instead as one alert with
-its own, separate, mail-only route. That raised alert is marked with the
-label `insist="unacknowledged"`; insist itself ignores any alert carrying
-that label, so it can never end up watching, escalating or raising an
+A `warning` ladder can be marked quiet at night: if its very first notice
+is due during the configured night hours, it goes out at a low priority
+(2) instead of at the loud priority the step would otherwise carry — that
+substitute is deferred, never skipped. When the night ends, the step the
+alert's age deserves by then is sent at its own, full, loud priority,
+whether or not the quiet substitute had already gone out. `critical` and
+`probe` ladders ignore the night entirely and always escalate at full
+volume.
+
+A `critical` ladder can mark one step as the point past which an
+unacknowledged instance is raised again — as its own single alert back
+into the alerting system on a separate, mail-only route, rather than as
+one more push notification among a mounting pile that eventually gets
+ignored. That raised alert carries the label key `insist` (its value is
+incidental); insist ignores every alert carrying that label key, regardless
+of its value, so it can never end up watching, escalating, or raising an
 alert about itself.
 
 ## Acknowledging
 
 Every notification for a `critical`, `warning` or `probe` instance carries
-an "Acknowledge" button. Pressing it posts a short signed body to a topic
-of its own — `a1.<instance-id>.<mac>` — where `<mac>` authenticates the
-instance id against a key only insist holds. The button's own ntfy token
-can only write to that one topic; it cannot read alerts, and it cannot post
-anything to the alert topic itself. A button token that leaks therefore
-cannot forge an alert with a working button, and can only ever acknowledge
-the one specific instance named in a body it captured — nothing more.
+an "Acknowledge" button, and each step for the same instance replaces the
+previous notification on the phone rather than stacking a new one beside
+it — the push service does this by matching on the instance id, which
+doubles as that service's own identifier for the message. Pressing the
+button posts a short signed body to a topic of its own —
+`a1.<instance-id>.<mac>` — where `<mac>` authenticates the instance id
+against a key only insist holds, compared in constant time so that timing
+cannot leak anything about a correct value. The button's own token is
+meant to be granted write access to that one topic only — never
+permission to read alerts, or to post to the alert topic itself — though
+enforcing that division is the operator's job, via the push service's own
+access control, not insist's. A button token that leaks therefore cannot
+forge an alert with a working button, and can only ever acknowledge the
+one specific instance named in a body it captured — nothing more.
+
+insist reads that topic as a stream, resuming after any disconnect or
+restart from the id of the last line it read rather than from the
+beginning of whatever the push service still has cached. A body that does
+not verify is rejected, counted in a metric, and logged without ever
+including the body itself — a rejected press's content might be anything a
+holder of a leaked button token chose to send. A body that verifies but
+names an instance already acknowledged or resolved, or one no longer known
+at all, changes nothing; pressing the same button twice is harmless. Once
+accepted, the notification for that instance is replaced by "Acknowledged
+HH:MM" at a low priority and without a button, and nothing escalates for it
+again. If the underlying alert resolves — acknowledged or not — its
+notification is replaced once more, by "Resolved", also at a low priority.
+Every acceptance, together with the stream position it was read at, is
+written to the state file in the same atomic write as everything else, so
+a restart resumes reading exactly where it left off.
 
 ## Failure behaviour
 
 Every failure inside insist is designed to be either louder or visible
 through some other, independent path — never silent. Mail is never routed
 through insist: it goes directly from the alerting system, so a dead or
-wedged insist never removes the household's oldest and most boring alerting
-channel. The external dead man's switch is pinged only after a
+wedged insist never removes the plainest, most established alerting
+channel there is. The external dead man's switch is pinged only after a
 reconciliation pass has actually succeeded and is still fresh; a hung or
 crashed insist starves it, and the switch itself raises the alarm from
 outside.
 
-A single pass of due sends is bounded: once the push service stops
-answering rather than merely refusing a message, the remaining sends of
-that pass are left for the next one instead of being retried one by one at
-a multi-second timeout each. Without that bound, a hung push service could
-hold the pass open long enough for the process's own systemd watchdog to
-kill it — turning a service that is merely waiting on a slow network call
-into one that gets restarted for it. The count of sends left over from a
-bounded pass is exposed as the `insist_publish_pending` metric, which is
-also what an external alert on "insist is not sending" watches: an
-escalation that is due but stuck behind a hung push service is a fact insist
-can report about itself even while the actual pushes are not going out.
+| Situation | What happens |
+|---|---|
+| insist is dead or restart-looping | No push notifications, but mail keeps working. Its watchdog ping stops, so the external dead man's switch raises the alarm from outside. |
+| insist hangs | Its unit is `Type=notify` with a `WatchdogSec` timeout; a ping sent from the tick loop must arrive before that timeout, or the service manager kills and restarts it. |
+| The alerting system itself is down | The watchdog ping stops (dead man's switch again). Known instances keep escalating — they are never treated as resolved just because reconciliation cannot currently ask. |
+| The alerting API answers with an error | An error from that API is never read as "nothing is firing". Only an HTTP 200 with a valid JSON array of alerts counts as an answer; anything else leaves the last known state untouched, and the dead man's switch ping ages. |
+| The push service is down | Mail keeps working. A step counts as sent only once the push service actually accepts it; otherwise it stays due and is retried on the next tick. If an instance is still unacknowledged after about an hour, its "unacknowledged" alert still reaches mail on its own route regardless. |
+| The acknowledgement stream breaks | insist reconnects with backoff, resuming from its last saved cursor. A press that cannot be read yet simply has not been read yet: the instance keeps escalating exactly as if nobody had pressed anything. |
+| The state file is unreadable | It is moved aside with a timestamp in its name, a counter records that this happened, and insist starts again with an empty state. Every alert that is actually still firing announces itself again on the next reconciliation. |
+| insist restarts | Its state lives on disk, so a restart is not a fresh start: the first reconciliation after coming back up re-establishes every instance that is still firing, and the acknowledgement stream resumes from its saved cursor rather than replaying or skipping. |
+| A webhook body cannot be parsed | Unknown fields are ignored; a body that cannot be read at all answers with a server error, so the alerting system's own retry delivers it again. |
+| A silence ends while the alert underneath is still firing | The same instance simply continues escalating according to its own age — a silence ending is not a new event to it. |
+
+A single pass of due sends is itself bounded: once the push service stops
+answering entirely — as opposed to merely refusing one message — the
+remaining sends in that pass are left for the next one, rather than each
+waiting out its own multi-second timeout in turn. Without that bound, a
+push service that merely hangs could hold the pass open long enough for
+insist's own watchdog to kill it — turning a service that is only waiting
+on a slow network call into one that gets restarted for it. Every send in
+a pass that did not succeed — whether left over because the pass was
+already halted, or attempted and refused by the push service itself — is
+counted in the `insist_publish_pending` metric; an external alert watching
+that metric for a value above zero for fifteen minutes is how "insist is
+not getting messages out" becomes visible on its own, even while the
+actual pushes are not going out.
 
 ## Rejected
 
