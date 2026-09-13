@@ -37,20 +37,27 @@
         };
       });
 
+      nixosModules.default = ./nix/module.nix;
+
       checks = forAll (pkgs: {
-        package = self.packages.${pkgs.system}.default;
-        clippy = self.packages.${pkgs.system}.default.overrideAttrs (old: {
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        clippy = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
           pname = "insist-clippy";
           nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clippy ];
           buildPhase = "cargo clippy --all-targets -- -D warnings";
           installPhase = "touch $out";
         });
-        fmt = self.packages.${pkgs.system}.default.overrideAttrs (old: {
+        fmt = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
           pname = "insist-fmt";
           nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.rustfmt ];
           buildPhase = "cargo fmt --check";
           installPhase = "touch $out";
         });
+        vm = import ./nix/test.nix {
+          inherit pkgs;
+          module = self.nixosModules.default;
+          package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
       });
     };
 }
