@@ -111,23 +111,40 @@ impl Engine {
         labels.get(&self.config.probe.label) == Some(&self.config.probe.value)
     }
 
+    /// Whether an API alert's receivers intersect `config.receivers`. `GET
+    /// /api/v2/alerts` also lists alerts routed to receivers insist never
+    /// gets a webhook for (mail-only, say); those must not become instances.
+    fn has_matching_receiver(&self, alert: &GettableAlert) -> bool {
+        alert
+            .receivers
+            .iter()
+            .any(|r| self.config.receivers.contains(&r.name))
+    }
+
+    /// Creates the instance if it is new, and always updates `ends_at` from
+    /// a real (non-zero) value — never overwriting a known deadline with an
+    /// unknown one, since a webhook never carries a real `endsAt` and must
+    /// not erase what an earlier API answer established.
     fn upsert(
         &mut self,
         fingerprint: &str,
         starts_at: Timestamp,
         labels: &Labels,
         annotations: &Labels,
+        ends_at: Option<Timestamp>,
         now: Timestamp,
     ) -> Option<InstanceId> {
         let (ladder, _) = self.config.ladder_for(labels)?;
         let id = InstanceId::of(fingerprint, starts_at);
         let probe = self.is_probe(labels);
-        self.state
+        let instance = self
+            .state
             .instances
             .entry(id.clone())
             .or_insert_with(|| Instance {
                 fingerprint: fingerprint.to_string(),
                 starts_at,
+                ends_at: None,
                 first_seen: now,
                 alertname: render::alertname(labels),
                 ladder,
@@ -141,6 +158,9 @@ impl Engine {
                 suppressed: false,
                 unacknowledged_raised: false,
             });
+        if let Some(e) = ends_at {
+            instance.ends_at = Some(e);
+        }
         Some(id)
     }
 
@@ -172,13 +192,22 @@ impl Engine {
                     instance.resolved_at.get_or_insert(now);
                 }
             } else {
-                self.upsert(
+                let ends_at = crate::alertmanager::known_ends_at(alert.ends_at);
+                if let Some(id) = self.upsert(
                     &alert.fingerprint,
                     alert.starts_at,
                     &alert.labels,
                     &alert.annotations,
+                    ends_at,
                     now,
-                );
+                ) {
+                    // Alertmanager never sends a webhook for a silenced or
+                    // inhibited alert, so its arrival is itself proof the
+                    // instance is no longer suppressed.
+                    if let Some(instance) = self.state.instances.get_mut(&id) {
+                        instance.suppressed = false;
+                    }
+                }
             }
         }
         effects.extend(self.tick(now));
@@ -198,11 +227,16 @@ impl Engine {
             if Self::is_own(&alert.labels) {
                 continue;
             }
+            if !self.has_matching_receiver(alert) {
+                continue;
+            }
+            let ends_at = crate::alertmanager::known_ends_at(alert.ends_at);
             if let Some(id) = self.upsert(
                 &alert.fingerprint,
                 alert.starts_at,
                 &alert.labels,
                 &alert.annotations,
+                ends_at,
                 now,
             ) {
                 if let Some(instance) = self.state.instances.get_mut(&id) {
@@ -211,10 +245,15 @@ impl Engine {
                 present.insert(id);
             }
         }
+        // Alertmanager keeps alerts in memory only: after a restart with no
+        // alerts re-posted yet, the API answers 200 []. Absence resolves an
+        // instance only once its last known endsAt has passed — otherwise a
+        // restart during an outage would announce a false all-clear.
         for (id, instance) in self.state.instances.iter_mut() {
             if instance.resolved_at.is_none()
-                && instance.first_seen <= fetched_at
                 && !present.contains(id)
+                && instance.first_seen <= fetched_at
+                && instance.ends_at.is_none_or(|e| e <= now)
             {
                 instance.resolved_at = Some(now);
             }
@@ -223,10 +262,13 @@ impl Engine {
     }
 
     pub fn tick(&mut self, now: Timestamp) -> Effects {
-        // Resolved before anything went out: nothing to take back on a phone.
-        self.state
-            .instances
-            .retain(|_, i| !(i.resolved_at.is_some() && i.last_step.is_none()));
+        // Resolved before anything went out: nothing to take back on a
+        // phone. But an acknowledgement proves a notification existed even
+        // if last_step was never confirmed (a defensive rule, not a path
+        // the public API normally produces), so Resolved must replace it.
+        self.state.instances.retain(|_, i| {
+            !(i.resolved_at.is_some() && i.last_step.is_none() && i.acknowledged_at.is_none())
+        });
 
         let mut effects = Effects::default();
         for (id, instance) in &self.state.instances {
@@ -561,10 +603,53 @@ mod tests {
             .filter(|a| a.status.state == "suppressed")
             .map(|a| InstanceId::of(&a.fingerprint, a.starts_at))
             .collect();
+        assert!(
+            !fx.publish.is_empty(),
+            "the non-suppressed alerts in the same answer must still publish"
+        );
         assert!(fx
             .publish
             .iter()
             .all(|o| !silenced.contains(o.id.as_ref().unwrap())));
+        let suppressed_id = &silenced[0];
+        let instance = e
+            .state()
+            .instances
+            .get(suppressed_id)
+            .expect("the silenced alert is still tracked, just not published");
+        assert!(
+            instance.suppressed,
+            "reconciliation must mark it suppressed"
+        );
+    }
+
+    #[test]
+    fn a_silence_that_ends_lets_the_instance_escalate_by_its_age() {
+        let mut e = engine();
+        let suppressed: Vec<GettableAlert> =
+            serde_json::from_str(&recorded("api-suppressed.json")).unwrap();
+        let critical = suppressed
+            .iter()
+            .find(|a| a.status.state == "suppressed")
+            .unwrap();
+        let t0 = critical.starts_at;
+        let id = InstanceId::of(&critical.fingerprint, t0);
+        e.on_reconcile(&suppressed, t0, t0);
+        assert!(e.state().instances.get(&id).unwrap().suppressed);
+
+        let active: Vec<GettableAlert> =
+            serde_json::from_str(&recorded("api-active.json")).unwrap();
+        let fx = e.on_reconcile(&active, plus(t0, 3600), plus(t0, 3600));
+        let step = fx
+            .publish
+            .iter()
+            .find(|o| o.id.as_ref() == Some(&id))
+            .expect("the unsilenced alert escalates");
+        assert_eq!(
+            step.kind,
+            Kind::Step(2),
+            "it climbs straight to the step its age deserves, not step 0"
+        );
     }
 
     #[test]
@@ -625,5 +710,149 @@ mod tests {
         let fx = e.on_webhook(&resolved, plus(t0, 5));
         assert!(fx.publish.is_empty());
         assert!(e.state().instances.is_empty());
+    }
+
+    #[test]
+    fn an_instance_with_a_future_ends_at_survives_reconciliation_until_it_passes() {
+        let mut e = engine();
+        let mut active: Vec<GettableAlert> =
+            serde_json::from_str(&recorded("api-active.json")).unwrap();
+        let t0 = active[0].starts_at;
+        let future_ends = plus(t0, 7200);
+        active[0].ends_at = future_ends;
+
+        let fx = e.on_reconcile(&active, t0, t0);
+        assert_eq!(fx.publish[0].kind, Kind::Step(0));
+        send_all(&mut e, &fx, t0);
+
+        // Alertmanager's storage is memory-only: an empty answer after a
+        // restart must not read as an all-clear before endsAt.
+        let empty: Vec<GettableAlert> = serde_json::from_str(&recorded("api-empty.json")).unwrap();
+        let fx = e.on_reconcile(&empty, plus(t0, 30), plus(t0, 60));
+        assert!(fx.publish.is_empty(), "no false Resolved before endsAt");
+        assert_eq!(e.open_instances(), 1);
+
+        // Listed again before endsAt: same instance, ladder not restarted.
+        let fx = e.on_reconcile(&active, plus(t0, 3600), plus(t0, 3600));
+        assert!(
+            !fx.publish.iter().any(|o| o.kind == Kind::Step(0)),
+            "the ladder must not restart: {fx:?}"
+        );
+        assert_eq!(e.open_instances(), 1);
+        send_all(&mut e, &fx, plus(t0, 3600));
+
+        // Once endsAt has passed and the alert is still absent, it resolves.
+        let fx = e.on_reconcile(&empty, plus(future_ends, 30), plus(future_ends, 60));
+        assert_eq!(fx.publish[0].kind, Kind::Resolved);
+    }
+
+    #[test]
+    fn an_api_alert_for_a_receiver_insist_does_not_own_is_skipped() {
+        let mut e = engine();
+        let mut active: Vec<GettableAlert> =
+            serde_json::from_str(&recorded("api-active.json")).unwrap();
+        active[0].receivers = vec![crate::alertmanager::Receiver {
+            name: "irgendein-mailversand".into(),
+        }];
+        let t0 = active[0].starts_at;
+        let fx = e.on_reconcile(&active, t0, t0);
+        assert!(fx.publish.is_empty());
+        assert!(e.state().instances.is_empty());
+    }
+
+    #[test]
+    fn a_firing_webhook_for_a_known_instance_clears_suppressed() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        let id = InstanceId::of(&w.alerts[0].fingerprint, t0);
+        e.on_webhook(&w, t0);
+        e.state_mut().instances.get_mut(&id).unwrap().suppressed = true;
+
+        // Alertmanager never webhooks a silenced or inhibited alert, so its
+        // arrival is itself proof the instance is no longer suppressed.
+        e.on_webhook(&w, plus(t0, 5));
+        assert!(!e.state().instances.get(&id).unwrap().suppressed);
+    }
+
+    #[test]
+    fn an_acknowledged_instance_can_still_resolve_with_the_same_id() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        let fx = e.on_webhook(&w, t0);
+        let id = fx.publish[0].id.clone().unwrap();
+        let body = fx.publish[0].button.clone().unwrap();
+        send_all(&mut e, &fx, t0);
+        assert!(matches!(
+            e.on_ack(&body, plus(t0, 10)),
+            AckOutcome::Accepted(_)
+        ));
+        let fx = e.tick(plus(t0, 11));
+        assert_eq!(fx.publish[0].kind, Kind::Acknowledged);
+        send_all(&mut e, &fx, plus(t0, 11));
+
+        let resolved: WebhookMessage = {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&recorded("webhook-firing-single.json")).unwrap();
+            v["alerts"][0]["status"] = "resolved".into();
+            serde_json::from_value(v).unwrap()
+        };
+        let fx = e.on_webhook(&resolved, plus(t0, 20));
+        assert_eq!(fx.publish.len(), 1);
+        assert_eq!(fx.publish[0].kind, Kind::Resolved);
+        assert_eq!(fx.publish[0].id, Some(id));
+    }
+
+    #[test]
+    fn an_instance_acknowledged_before_any_step_was_confirmed_still_resolves_visibly() {
+        // state_mut reaches a shape the public flow does not normally
+        // produce (an ack without a prior confirmed step), to pin down the
+        // defensive rule: a pressed button proves a notification exists, so
+        // Resolved must replace it rather than vanish silently.
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        e.on_webhook(&w, t0);
+        let id = InstanceId::of(&w.alerts[0].fingerprint, t0);
+        e.state_mut()
+            .instances
+            .get_mut(&id)
+            .unwrap()
+            .acknowledged_at = Some(t0);
+
+        let resolved: WebhookMessage = {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&recorded("webhook-firing-single.json")).unwrap();
+            v["alerts"][0]["status"] = "resolved".into();
+            serde_json::from_value(v).unwrap()
+        };
+        let fx = e.on_webhook(&resolved, plus(t0, 5));
+        assert_eq!(fx.publish.len(), 1);
+        assert_eq!(fx.publish[0].kind, Kind::Resolved);
+        assert_eq!(fx.publish[0].id, Some(id));
+    }
+
+    #[test]
+    fn no_unacknowledged_mail_is_raised_once_a_human_has_acknowledged() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        let fx = e.on_webhook(&w, t0);
+        let body = fx.publish[0].button.clone().unwrap();
+        send_all(&mut e, &fx, t0);
+        assert!(matches!(
+            e.on_ack(&body, plus(t0, 10)),
+            AckOutcome::Accepted(_)
+        ));
+        let fx = e.tick(plus(t0, 20));
+        send_all(&mut e, &fx, plus(t0, 20));
+
+        // Long past the raise_unacknowledged step (3600 s): must not raise.
+        let fx = e.tick(plus(t0, 4000));
+        assert!(
+            fx.raise.is_empty(),
+            "acknowledged instances never raise the unacknowledged mail"
+        );
     }
 }

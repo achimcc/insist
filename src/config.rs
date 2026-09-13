@@ -19,6 +19,11 @@ pub struct Config {
     pub tick_secs: u64,
     pub watchdog_max_age_secs: u64,
     pub unacknowledged_alertname: String,
+    /// The Alertmanager receivers whose webhook points at insist. `GET
+    /// /api/v2/alerts` also returns alerts insist never received a webhook
+    /// for (routed to a mail-only receiver, say); reconciliation skips any
+    /// alert whose receivers do not intersect this list.
+    pub receivers: Vec<String>,
     pub probe: ProbeMatch,
     pub night: crate::ladder::Night,
     pub ladders: std::collections::BTreeMap<String, crate::ladder::Ladder>,
@@ -83,6 +88,9 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         use anyhow::bail;
+        if self.receivers.is_empty() {
+            bail!("receivers must not be empty");
+        }
         for name in ["critical", "warning", "probe"] {
             if !self.ladders.contains_key(name) {
                 bail!("the required ladder {name} is missing");
@@ -246,5 +254,20 @@ pub(crate) mod tests {
             let err = Config::from_toml(&bad).unwrap_err().to_string();
             assert!(err.contains(name), "{err}");
         }
+    }
+
+    #[test]
+    fn empty_receivers_is_an_error() {
+        assert!(
+            MINIMAL.contains("receivers = [\"rec\"]"),
+            "fixture no longer names a receiver"
+        );
+        let bad = MINIMAL.replace("receivers = [\"rec\"]", "receivers = []");
+        assert_ne!(
+            &bad, MINIMAL,
+            "removing the receiver did not change the fixture"
+        );
+        let err = Config::from_toml(&bad).unwrap_err().to_string();
+        assert!(err.contains("receiver"), "{err}");
     }
 }

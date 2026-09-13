@@ -32,6 +32,7 @@ reconcile_secs = 60
 tick_secs = 15
 watchdog_max_age_secs = 300
 unacknowledged_alertname = "AlarmUnquittiert"
+receivers = ["rec"]
 
 [probe]
 label = "insist_probe"

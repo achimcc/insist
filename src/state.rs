@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 pub struct Instance {
     pub fingerprint: String,
     pub starts_at: Timestamp,
+    /// The last real `endsAt` Alertmanager gave for it (its zero value maps
+    /// to `None`, meaning no known deadline). Reconciliation only resolves
+    /// an absent instance once this has passed — Alertmanager's storage is
+    /// memory-only, and a restart must not read as an all-clear before then.
+    /// `#[serde(default)]`: a state file written before this field existed
+    /// must still load.
+    #[serde(default)]
+    pub ends_at: Option<Timestamp>,
     /// When insist first learned of it. Reconciliation must not resolve an
     /// instance it learned of after the API answer it is looking at was taken.
     pub first_seen: Timestamp,
@@ -110,6 +118,7 @@ mod tests {
             Instance {
                 fingerprint: "a1b2c3d4e5f60718".into(),
                 starts_at: now(),
+                ends_at: None,
                 first_seen: now(),
                 alertname: "UnitFehlgeschlagen".into(),
                 ladder: "critical".into(),
@@ -176,5 +185,35 @@ mod tests {
         let path = dir.path().join("state.json");
         std::fs::create_dir(&path).unwrap();
         assert!(State::load(&path, now()).is_err());
+    }
+
+    #[test]
+    fn an_old_state_file_without_ends_at_loads_with_none() {
+        let mut with_field = sample();
+        with_field
+            .instances
+            .get_mut(&InstanceId::parse("0123456789abcdef").unwrap())
+            .unwrap()
+            .ends_at = Some(now());
+        let mut value = serde_json::to_value(&with_field).unwrap();
+        let removed = value["instances"]["0123456789abcdef"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ends_at");
+        assert!(
+            removed.is_some(),
+            "ends_at was not present in the serialised instance"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        let loaded = State::load(&path, now()).unwrap();
+        assert!(
+            loaded.moved_corrupt_to.is_none(),
+            "an old file must not be treated as corrupt"
+        );
+        let instance = loaded.state.instances.values().next().unwrap();
+        assert_eq!(instance.ends_at, None);
     }
 }

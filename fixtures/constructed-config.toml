@@ -9,6 +9,8 @@ reconcile_secs = 60
 tick_secs = 15
 watchdog_max_age_secs = 300
 unacknowledged_alertname = "AlarmUnquittiert"
+# "rec" is the receiver name used when recording fixtures/alertmanager-0.31.1.
+receivers = ["rec"]
 
 [probe]
 label = "insist_probe"
