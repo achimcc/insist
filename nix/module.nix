@@ -53,7 +53,12 @@ in
         StartLimitIntervalSec = 300;
       };
       serviceConfig = {
-        Type = "simple";
+        # notify: insist reports READY after its first reconciliation, and
+        # pings the watchdog from its tick loop. A hung loop is restarted by
+        # systemd; a dead one starves the dead man's switch.
+        Type = "notify";
+        NotifyAccess = "main";
+        WatchdogSec = "120s";
         ExecStart = "${lib.getExe cfg.package} ${configFile}";
         Restart = "on-failure";
         RestartSec = "10s";
