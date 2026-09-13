@@ -1,8 +1,9 @@
 //! Alertmanager's wire format, as recorded in fixtures/alertmanager-0.31.1.
 //! Only the fields this program reads are declared.
 use jiff::Timestamp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 pub type Labels = BTreeMap<String, String>;
 
@@ -65,6 +66,72 @@ const UNSET_ENDS_AT: &str = "0001-01-01T00:00:00Z";
 pub fn known_ends_at(ends_at: Timestamp) -> Option<Timestamp> {
     let unset: Timestamp = UNSET_ENDS_AT.parse().expect("valid constant timestamp");
     (ends_at != unset).then_some(ends_at)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostableAlert {
+    pub labels: Labels,
+    pub annotations: Labels,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<Timestamp>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    #[error("Alertmanager answered HTTP {0}")]
+    Status(u16),
+    #[error("Alertmanager's answer is not a list of alerts")]
+    Malformed,
+    #[error("Alertmanager could not be reached")]
+    Transport,
+}
+
+pub struct AlertmanagerClient {
+    http: reqwest::Client,
+    base: String,
+}
+
+impl AlertmanagerClient {
+    pub fn new(base: &str) -> anyhow::Result<AlertmanagerClient> {
+        Ok(AlertmanagerClient {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()?,
+            base: base.trim_end_matches('/').to_string(),
+        })
+    }
+
+    /// Only a 200 with a JSON array counts. Anything else is an error, and an
+    /// error must never be read as "nothing is firing".
+    pub async fn alerts(&self) -> Result<Vec<GettableAlert>, ApiError> {
+        let answer = self
+            .http
+            .get(format!("{}/api/v2/alerts", self.base))
+            .send()
+            .await
+            .map_err(|_| ApiError::Transport)?;
+        if answer.status().as_u16() != 200 {
+            return Err(ApiError::Status(answer.status().as_u16()));
+        }
+        let bytes = answer.bytes().await.map_err(|_| ApiError::Transport)?;
+        serde_json::from_slice(&bytes).map_err(|_| ApiError::Malformed)
+    }
+
+    pub async fn post(&self, alerts: &[PostableAlert]) -> Result<(), ApiError> {
+        let answer = self
+            .http
+            .post(format!("{}/api/v2/alerts", self.base))
+            .json(alerts)
+            .send()
+            .await
+            .map_err(|_| ApiError::Transport)?;
+        if answer.status().is_success() {
+            Ok(())
+        } else {
+            Err(ApiError::Status(answer.status().as_u16()))
+        }
+    }
 }
 
 #[cfg(test)]

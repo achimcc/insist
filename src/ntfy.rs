@@ -70,6 +70,7 @@ pub enum PublishError {
 
 pub struct NtfyClient {
     http: reqwest::Client,
+    stream_http: reqwest::Client,
     base: String,
     token: Secret,
 }
@@ -79,6 +80,9 @@ impl NtfyClient {
         Ok(NtfyClient {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .build()?,
+            stream_http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
                 .build()?,
             base: base.trim_end_matches('/').to_string(),
             token,
@@ -102,6 +106,73 @@ impl NtfyClient {
             Ok(())
         } else {
             Err(PublishError::Status(answer.status().as_u16()))
+        }
+    }
+
+    /// Reads `<topic>/json` from `since` (or everything ntfy still caches) and
+    /// hands every message event to `tx`. Returns Ok when ntfy closes the
+    /// connection; the caller reconnects. `idle` must exceed ntfy's keepalive
+    /// interval (45 s by default) — silence longer than that is a dead link.
+    pub async fn read_acks(
+        &self,
+        topic: &Secret,
+        since: Option<&str>,
+        idle: Duration,
+        tx: &tokio::sync::mpsc::UnboundedSender<StreamLine>,
+    ) -> Result<(), StreamError> {
+        let request = self
+            .stream_http
+            .get(format!("{}/{}/json", self.base, topic.expose()))
+            .query(&[("since", since.unwrap_or("all"))])
+            .bearer_auth(self.token.expose())
+            .send();
+        let mut answer = tokio::time::timeout(idle, request)
+            .await
+            .map_err(|_| StreamError::Idle)?
+            .map_err(|_| StreamError::Transport)?;
+        if !answer.status().is_success() {
+            return Err(StreamError::Status(answer.status().as_u16()));
+        }
+        let mut buffer: Vec<u8> = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout(idle, answer.chunk())
+                .await
+                .map_err(|_| StreamError::Idle)?
+                .map_err(|_| StreamError::Transport)?;
+            let Some(chunk) = chunk else { break };
+            buffer.extend_from_slice(&chunk);
+            while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=end).collect();
+                deliver(&line, tx);
+            }
+        }
+        deliver(&buffer, tx);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StreamLine {
+    pub id: String,
+    pub event: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StreamError {
+    #[error("ntfy answered HTTP {0}")]
+    Status(u16),
+    #[error("ntfy sent nothing, not even a keepalive, within the idle limit")]
+    Idle,
+    #[error("ntfy could not be reached")]
+    Transport,
+}
+
+fn deliver(line: &[u8], tx: &tokio::sync::mpsc::UnboundedSender<StreamLine>) {
+    if let Ok(parsed) = serde_json::from_slice::<StreamLine>(line) {
+        if parsed.event == "message" {
+            let _ = tx.send(parsed);
         }
     }
 }
