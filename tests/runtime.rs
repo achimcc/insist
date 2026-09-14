@@ -29,6 +29,12 @@ struct World {
 
 impl World {
     async fn new(ntfy_code: u16) -> World {
+        World::with_watchdog_url(ntfy_code, None).await
+    }
+
+    /// `watchdog_url`: where the dead man's switch is expected; `None` is
+    /// the `dog` mock, which answers 200.
+    async fn with_watchdog_url(ntfy_code: u16, watchdog_url: Option<String>) -> World {
         let ntfy = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
@@ -53,8 +59,8 @@ impl World {
             );
         let config = Config::from_toml(&toml).unwrap();
         let secrets = Secrets::parse(&format!(
-            "NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=tk_alarm\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=3f9a0c1e5b7d2f4a\nWATCHDOG_URL={}/ping/x\n",
-            dog.uri()
+            "NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=tk_alarm\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=3f9a0c1e5b7d2f4a\nWATCHDOG_URL={}\n",
+            watchdog_url.unwrap_or_else(|| format!("{}/ping/x", dog.uri()))
         ))
         .unwrap();
         let webhook: insist::alertmanager::WebhookMessage =
@@ -474,5 +480,110 @@ async fn a_future_start_is_counted_once_on_the_metrics() {
     assert!(
         metrics.contains("\ninsist_future_starts_total 1\n"),
         "{metrics}"
+    );
+}
+
+/// The value of one metric line, read by name from `/metrics`.
+fn metric(text: &str, name: &str) -> String {
+    text.lines()
+        .find_map(|l| l.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("{name} missing from:\n{text}"))
+        .to_string()
+}
+
+async fn good_reconcile(w: &World) {
+    Mock::given(method("GET"))
+        .and(path("/api/v2/alerts"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(recorded("alertmanager-0.31.1/api-empty.json")),
+        )
+        .mount(&w.am)
+        .await;
+    assert!(w.runtime.lock().await.reconcile_once().await);
+}
+
+async fn scrape(w: &World) -> String {
+    w.call(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .1
+}
+
+#[tokio::test]
+async fn a_forwarded_watchdog_ping_sets_the_success_gauge_and_counts_no_failure() {
+    let w = World::new(200).await;
+    good_reconcile(&w).await;
+    let before = scrape(&w).await;
+    assert_eq!(
+        metric(&before, "insist_watchdog_last_success_timestamp_seconds"),
+        "0"
+    );
+    let (code, _) = w
+        .call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(w.dog.received_requests().await.unwrap().len(), 1);
+    let after = scrape(&w).await;
+    let now = w.now.lock().unwrap().as_second().to_string();
+    assert_eq!(
+        metric(&after, "insist_watchdog_last_success_timestamp_seconds"),
+        now
+    );
+    assert_eq!(
+        metric(&after, "insist_watchdog_forward_failures_total"),
+        "0"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_watchdog_forward_is_counted_and_leaves_the_success_gauge_alone() {
+    let w = World::new(200).await;
+    good_reconcile(&w).await;
+    let (code, _) = w
+        .call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    let succeeded_at = w.now.lock().unwrap().as_second().to_string();
+
+    w.dog.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/ping/x"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&w.dog)
+        .await;
+    // Still fresh (limit 300 s): the ping is forwarded, and refused.
+    w.advance(10);
+    let (code, _) = w
+        .call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await;
+    assert_eq!(code, StatusCode::BAD_GATEWAY);
+    assert_eq!(w.dog.received_requests().await.unwrap().len(), 1);
+    let m = scrape(&w).await;
+    assert_eq!(metric(&m, "insist_watchdog_forward_failures_total"), "1");
+    assert_eq!(
+        metric(&m, "insist_watchdog_last_success_timestamp_seconds"),
+        succeeded_at
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_dead_mans_switch_is_counted_and_never_named() {
+    // A port that was just free: nothing listens, the connection is refused.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let w = World::with_watchdog_url(200, Some(format!("http://{closed}/ping/secret-path"))).await;
+    good_reconcile(&w).await;
+    let (code, body) = w
+        .call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await;
+    assert_eq!(code, StatusCode::BAD_GATEWAY);
+    assert!(!body.contains("secret-path"), "{body}");
+    let m = scrape(&w).await;
+    assert_eq!(metric(&m, "insist_watchdog_forward_failures_total"), "1");
+    assert_eq!(
+        metric(&m, "insist_watchdog_last_success_timestamp_seconds"),
+        "0"
     );
 }

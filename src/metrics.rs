@@ -1,4 +1,4 @@
-//! Prometheus text format, written by hand: ten numbers do not need a crate.
+//! Prometheus text format, written by hand: a dozen numbers do not need a crate.
 use jiff::Timestamp;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,12 @@ pub struct Metrics {
     /// of insist's clock. They escalate from first sight instead; this
     /// makes the producer's fault visible.
     pub future_starts_total: u64,
+    /// Watchdog pings insist tried to forward to the dead man's switch and
+    /// that did not get a 2xx: unreachable, timed out or refused. Without
+    /// it a switch that stopped accepting insist's pings shows up only in
+    /// the journal — and as the switch's own alarm, much later.
+    pub watchdog_forward_failures_total: u64,
+    pub last_watchdog_success: Option<Timestamp>,
     pub last_reconcile_success: Option<Timestamp>,
     pub last_publish_success: Option<Timestamp>,
     pub open_instances: u64,
@@ -86,6 +92,12 @@ impl Metrics {
             "Instances neither acknowledged nor resolved.",
             self.open_instances.to_string(),
         );
+        line(
+            "insist_watchdog_forward_failures_total",
+            "counter",
+            "Watchdog pings the dead man's switch did not accept (unreachable, timed out or non-2xx).",
+            self.watchdog_forward_failures_total.to_string(),
+        );
         let seconds = |t: Option<Timestamp>| t.map(|t| t.as_second()).unwrap_or(0).to_string();
         line(
             "insist_last_reconcile_success_timestamp_seconds",
@@ -98,6 +110,12 @@ impl Metrics {
             "gauge",
             "Last notification ntfy accepted.",
             seconds(self.last_publish_success),
+        );
+        line(
+            "insist_watchdog_last_success_timestamp_seconds",
+            "gauge",
+            "Last watchdog ping the dead man's switch accepted with a 2xx; 0 until the first.",
+            seconds(self.last_watchdog_success),
         );
         out
     }
@@ -125,6 +143,8 @@ mod tests {
             "insist_open_instances",
             "insist_last_reconcile_success_timestamp_seconds",
             "insist_last_publish_success_timestamp_seconds",
+            "insist_watchdog_forward_failures_total",
+            "insist_watchdog_last_success_timestamp_seconds",
         ] {
             assert!(out.contains(name), "{name} missing from:\n{out}");
         }

@@ -69,7 +69,7 @@ async fn watchdog(State(shared): State<Shared>, body: Bytes) -> StatusCode {
     let target = shared.lock().await.watchdog_target();
     match target {
         Err(code) => code,
-        Ok((client, url)) => send_watchdog(client, url, body).await,
+        Ok(target) => send_watchdog(target, body).await,
     }
 }
 

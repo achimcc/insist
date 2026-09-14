@@ -285,9 +285,10 @@ impl Runtime {
 
     /// Checks freshness under the runtime lock, then hands back what a
     /// caller needs to forward the ping *outside* that lock: a cheap client
-    /// clone (reqwest::Client is `Arc`-backed) and an owned copy of the
-    /// watchdog URL. Never logs the URL — it is a credential.
-    pub fn watchdog_target(&self) -> Result<(reqwest::Client, String), StatusCode> {
+    /// clone (reqwest::Client is `Arc`-backed), an owned copy of the
+    /// watchdog URL, and the metrics and clock to record the outcome with.
+    /// Never logs the URL — it is a credential.
+    pub fn watchdog_target(&self) -> Result<WatchdogTarget, StatusCode> {
         let now = self.now();
         let last = self.metrics.lock().unwrap().last_reconcile_success;
         let fresh = last.is_some_and(|t| {
@@ -300,32 +301,55 @@ impl Runtime {
             );
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        Ok((
-            self.watchdog.clone(),
-            self.secrets.watchdog_url.expose().to_string(),
-        ))
+        Ok(WatchdogTarget {
+            client: self.watchdog.clone(),
+            url: copy(&self.secrets.watchdog_url),
+            metrics: self.metrics.clone(),
+            clock: self.clock.clone(),
+        })
     }
+}
+
+/// Everything a watchdog forward needs, copied out from behind the runtime
+/// lock. No Debug: the URL is a credential.
+pub struct WatchdogTarget {
+    client: reqwest::Client,
+    url: Secret,
+    metrics: MetricsHandle,
+    clock: Clock,
 }
 
 /// The POST itself, run without holding the runtime lock: `send_watchdog`
 /// needs no `&Runtime` at all, only what `watchdog_target` already copied
-/// out from behind the lock.
-pub async fn send_watchdog(client: reqwest::Client, url: String, body: Bytes) -> StatusCode {
-    match client
-        .post(url)
+/// out from behind the lock. Every failed forward is counted; a 2xx moves
+/// the success gauge.
+pub async fn send_watchdog(target: WatchdogTarget, body: Bytes) -> StatusCode {
+    let answer = target
+        .client
+        .post(target.url.expose())
         .header("content-type", "application/json")
         .body(body)
         .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => StatusCode::OK,
+        .await;
+    let ok = match answer {
+        Ok(r) if r.status().is_success() => true,
         Ok(r) => {
             tracing::error!("dead man's switch answered HTTP {}", r.status().as_u16());
-            StatusCode::BAD_GATEWAY
+            false
         }
+        // The reqwest error is not logged: its Display carries the URL.
         Err(_) => {
             tracing::error!("dead man's switch could not be reached");
-            StatusCode::BAD_GATEWAY
+            false
         }
+    };
+    let now = (target.clock)();
+    let mut m = target.metrics.lock().unwrap();
+    if ok {
+        m.last_watchdog_success = Some(now);
+        StatusCode::OK
+    } else {
+        m.watchdog_forward_failures_total += 1;
+        StatusCode::BAD_GATEWAY
     }
 }
