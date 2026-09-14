@@ -273,6 +273,10 @@ async fn after_an_hour_unacknowledged_the_mail_alert_is_raised_in_alertmanager()
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
     assert_eq!(raised.len(), 1);
+    // Sent explicitly: Alertmanager 0.31.1 fills an omitted startsAt with
+    // endsAt (measured 2026-09-14), which would date the mail an hour ahead.
+    let now = *w.now.lock().unwrap();
+    assert_eq!(raised[0][0]["startsAt"], now.to_string());
     let labels = &raised[0][0]["labels"];
     assert_eq!(labels["alertname"], "AlarmUnquittiert");
     assert_eq!(labels["insist"], "unacknowledged");

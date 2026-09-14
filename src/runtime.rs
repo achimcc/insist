@@ -150,6 +150,9 @@ impl Runtime {
             let alert = PostableAlert {
                 labels,
                 annotations,
+                // Explicit: Alertmanager 0.31.1 fills an omitted startsAt
+                // with endsAt, dating this alert an hour into the future.
+                starts_at: Some(now),
                 ends_at: Some(now + SignedDuration::from_hours(1)),
             };
             match self.alertmanager.post(&[alert]).await {

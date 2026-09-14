@@ -74,6 +74,8 @@ pub struct PostableAlert {
     pub labels: Labels,
     pub annotations: Labels,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ends_at: Option<Timestamp>,
 }
 

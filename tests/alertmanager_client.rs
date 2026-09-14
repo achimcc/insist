@@ -81,6 +81,7 @@ async fn posts_alerts_in_the_shape_the_api_expects() {
     let alert = PostableAlert {
         labels,
         annotations: Default::default(),
+        starts_at: Some("2026-09-13T12:00:00Z".parse().unwrap()),
         ends_at: Some("2026-09-13T13:00:00Z".parse().unwrap()),
     };
     AlertmanagerClient::new(&s.uri())
@@ -93,6 +94,10 @@ async fn posts_alerts_in_the_shape_the_api_expects() {
     assert!(body.starts_with('['), "{body}");
     assert!(
         body.contains("\"endsAt\":\"2026-09-13T13:00:00Z\""),
+        "{body}"
+    );
+    assert!(
+        body.contains("\"startsAt\":\"2026-09-13T12:00:00Z\""),
         "{body}"
     );
     assert!(
