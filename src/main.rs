@@ -5,6 +5,7 @@ use insist::secret::Secret;
 use insist::secrets::Secrets;
 use insist::server::{router, App, Shared};
 use insist::state::State;
+use insist::tasks::{run_tasks, Tasks};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
@@ -46,8 +47,10 @@ async fn main() -> Result<()> {
     shared.lock().await.reconcile_once().await;
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
+    // Each of these loops forever; run_tasks ends the process if one stops.
+    let mut tasks = Tasks::default();
     let s = shared.clone();
-    tokio::spawn(async move {
+    tasks.spawn("reconciliation", async move {
         let mut every = tokio::time::interval(Duration::from_secs(reconcile));
         // A pass bounded by a hanging ntfy can still run long; catching up
         // with a burst of immediate ticks afterwards would only make the
@@ -60,7 +63,7 @@ async fn main() -> Result<()> {
     });
 
     let s = shared.clone();
-    tokio::spawn(async move {
+    tasks.spawn("tick", async move {
         let mut every = tokio::time::interval(Duration::from_secs(tick));
         every.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
@@ -74,14 +77,14 @@ async fn main() -> Result<()> {
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let s = shared.clone();
-    tokio::spawn(async move {
+    tasks.spawn("acknowledgement handling", async move {
         while let Some(line) = rx.recv().await {
             s.lock().await.acknowledge(line).await;
         }
     });
     let s = shared.clone();
     let seen = metrics.clone();
-    tokio::spawn(async move {
+    tasks.spawn("acknowledgement stream", async move {
         let mut backoff = 1u64;
         loop {
             let since = s.lock().await.engine.state().ack_cursor.clone();
@@ -106,7 +109,7 @@ async fn main() -> Result<()> {
     });
 
     tracing::info!("listening");
-    axum::serve(
+    let server = axum::serve(
         listener,
         router(App {
             runtime: shared,
@@ -115,7 +118,6 @@ async fn main() -> Result<()> {
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
-    })
-    .await?;
-    Ok(())
+    });
+    run_tasks(tasks, server).await
 }

@@ -13,3 +13,4 @@ pub mod secret;
 pub mod secrets;
 pub mod server;
 pub mod state;
+pub mod tasks;
