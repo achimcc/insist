@@ -71,6 +71,17 @@ in
         ProtectKernelTunables = true;
         RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
         SystemCallFilter = [ "@system-service" ];
+        # One attribute per option. An empty string is the whole value of
+        # CapabilityBoundingSet: insist binds an unprivileged port and needs
+        # no capability at all.
+        CapabilityBoundingSet = "";
+        PrivateDevices = true;
+        ProtectKernelModules = true;
+        ProtectControlGroups = true;
+        RestrictNamespaces = true;
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        SystemCallArchitectures = "native";
       } // cfg.extraServiceConfig;
     };
   };

@@ -321,5 +321,16 @@ pkgs.testers.runNixOSTest {
         show = machine.succeed("systemctl show insist.service -p NRestarts -p WatchdogUSec").splitlines()
         assert "NRestarts=0" in show, show
         assert "WatchdogUSec=2min" in show, show
+
+    with subtest("the unit runs with no capabilities and no new privileges"):
+        # Read from the running manager, not from the module source: what
+        # counts is the set systemd applies, and empty means no capability.
+        show = machine.succeed("systemctl show insist.service -p CapabilityBoundingSet -p NoNewPrivileges").splitlines()
+        assert "CapabilityBoundingSet=" in show, show
+        assert "NoNewPrivileges=yes" in show, show
+        # And the process still runs under all of it, with an empty set.
+        machine.succeed("systemctl is-active insist.service")
+        pid = machine.succeed("systemctl show insist.service -p MainPID --value").strip()
+        machine.succeed(f"grep -qxP 'CapBnd:\\t0{{16}}' /proc/{pid}/status")
   '';
 }
