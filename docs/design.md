@@ -170,6 +170,20 @@ that metric for a value above zero for fifteen minutes is how "insist is
 not getting messages out" becomes visible on its own, even while the
 actual pushes are not going out.
 
+An alert whose `startsAt` lies in the future must not switch escalation
+off. It happens: Alertmanager 0.31.1 fills an omitted `startsAt` with the
+posted `endsAt` (measured 2026-09-14), and a producer's clock can run ahead.
+Measured from such a `startsAt`, an instance's age would stay at zero until
+that moment — the first notice goes out, and then nothing, possibly for a
+day. Every age insist derives (the ladder's steps, the minutes in the
+"unacknowledged" alert, the time a notification says it started) is
+therefore measured from the earlier of `startsAt` and the moment insist
+first saw the instance; for a correct producer nothing changes. The fault
+itself stays visible: the first time insist records an instance more than
+a minute ahead of its own clock, it logs one line and counts it in
+`insist_future_starts_total`. insist's own "unacknowledged" alert always
+sends `startsAt` explicitly.
+
 ## Rejected
 
 Using an existing "silence" mechanism as an acknowledgement was rejected:

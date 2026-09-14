@@ -436,3 +436,43 @@ async fn acknowledge_saves_the_ack_cursor_to_disk() {
     let saved = std::fs::read_to_string(w.dir.path().join("state.json")).unwrap();
     assert!(saved.contains("m9"), "{saved}");
 }
+
+#[tokio::test]
+async fn a_future_start_is_counted_once_on_the_metrics() {
+    let w = World::new(200).await;
+    let (_, metrics) = w
+        .call(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await;
+    assert!(
+        metrics.contains("\ninsist_future_starts_total 0\n"),
+        "{metrics}"
+    );
+
+    // Constructed from the recorded webhook: startsAt a day ahead of the
+    // clock, the shape Alertmanager gives an alert posted with endsAt only.
+    let mut v: serde_json::Value =
+        serde_json::from_str(&recorded("alertmanager-0.31.1/webhook-firing-single.json")).unwrap();
+    let ahead = *w.now.lock().unwrap() + SignedDuration::from_hours(26);
+    v["alerts"][0]["startsAt"] = ahead.to_string().into();
+    let body = v.to_string();
+    for _ in 0..2 {
+        let (code, _) = w
+            .call(
+                Request::post("/")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(code, StatusCode::OK);
+        w.advance(30);
+        w.runtime.lock().await.tick_once().await;
+    }
+    let (_, metrics) = w
+        .call(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await;
+    assert!(
+        metrics.contains("\ninsist_future_starts_total 1\n"),
+        "{metrics}"
+    );
+}

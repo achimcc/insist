@@ -16,6 +16,10 @@ use std::collections::BTreeSet;
 /// "unacknowledged" mail). They are routed to mail only and never handled.
 pub const OWN_LABEL: &str = "insist";
 
+/// Clock skew up to this much between a producer and insist is noise, not a
+/// fault worth a log line.
+pub const FUTURE_START_TOLERANCE_SECS: i64 = 60;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
     /// The step index and whether this send is the night substitute (see
@@ -47,16 +51,29 @@ pub struct Unacknowledged {
     pub minutes: i64,
 }
 
+/// An instance recorded for the first time whose `startsAt` lies more than
+/// `FUTURE_START_TOLERANCE_SECS` ahead of insist's clock. Reported once, so
+/// the runtime can log and count the producer's fault.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FutureStart {
+    pub id: InstanceId,
+    pub alertname: String,
+    pub starts_at: Timestamp,
+    pub first_seen: Timestamp,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct Effects {
     pub publish: Vec<Outgoing>,
     pub raise: Vec<Unacknowledged>,
+    pub future_starts: Vec<FutureStart>,
 }
 
 impl Effects {
     fn extend(&mut self, other: Effects) {
         self.publish.extend(other.publish);
         self.raise.extend(other.raise);
+        self.future_starts.extend(other.future_starts);
     }
 }
 
@@ -127,7 +144,10 @@ impl Engine {
     /// Creates the instance if it is new, and always updates `ends_at` from
     /// a real (non-zero) value — never overwriting a known deadline with an
     /// unknown one, since a webhook never carries a real `endsAt` and must
-    /// not erase what an earlier API answer established.
+    /// not erase what an earlier API answer established. A new instance
+    /// whose `startsAt` lies in the future is reported in `effects` — once,
+    /// here, where it is first recorded.
+    #[allow(clippy::too_many_arguments)]
     fn upsert(
         &mut self,
         fingerprint: &str,
@@ -136,10 +156,21 @@ impl Engine {
         annotations: &Labels,
         ends_at: Option<Timestamp>,
         now: Timestamp,
+        effects: &mut Effects,
     ) -> Option<InstanceId> {
         let (ladder, _) = self.config.ladder_for(labels)?;
         let id = InstanceId::of(fingerprint, starts_at);
         let probe = self.is_probe(labels);
+        if !self.state.instances.contains_key(&id)
+            && starts_at.as_second() - now.as_second() > FUTURE_START_TOLERANCE_SECS
+        {
+            effects.future_starts.push(FutureStart {
+                id: id.clone(),
+                alertname: render::alertname(labels),
+                starts_at,
+                first_seen: now,
+            });
+        }
         let instance = self
             .state
             .instances
@@ -204,6 +235,7 @@ impl Engine {
                     &alert.annotations,
                     ends_at,
                     now,
+                    &mut effects,
                 ) {
                     // Alertmanager never sends a webhook for a silenced or
                     // inhibited alert, so its arrival is itself proof the
@@ -226,6 +258,7 @@ impl Engine {
         fetched_at: Timestamp,
         now: Timestamp,
     ) -> Effects {
+        let mut effects = Effects::default();
         let mut present = BTreeSet::new();
         for alert in alerts {
             if Self::is_own(&alert.labels) {
@@ -242,6 +275,7 @@ impl Engine {
                 &alert.annotations,
                 ends_at,
                 now,
+                &mut effects,
             ) {
                 if let Some(instance) = self.state.instances.get_mut(&id) {
                     instance.suppressed = alert.status.state == "suppressed";
@@ -262,7 +296,8 @@ impl Engine {
                 instance.resolved_at = Some(now);
             }
         }
-        self.tick(now)
+        effects.extend(self.tick(now));
+        effects
     }
 
     pub fn tick(&mut self, now: Timestamp) -> Effects {
@@ -306,7 +341,7 @@ impl Engine {
             };
             if let Some(due) = ladder::due(
                 ladder,
-                instance.starts_at,
+                instance.effective_start(),
                 &progress,
                 now,
                 &self.config.night,
@@ -318,7 +353,7 @@ impl Engine {
                         id: id.clone(),
                         alertname: instance.alertname.clone(),
                         summary: instance.summary.clone(),
-                        minutes: (now.as_second() - instance.starts_at.as_second()) / 60,
+                        minutes: (now.as_second() - instance.effective_start().as_second()) / 60,
                     });
                 }
             }
@@ -337,7 +372,7 @@ impl Engine {
                 "{} ({} {})",
                 i.summary,
                 self.config.texts.since,
-                render::clock(i.starts_at, &self.tz)
+                render::clock(i.effective_start(), &self.tz)
             ),
             priority: due.priority,
             tags: vec![if loud { "rotating_light" } else { "warning" }.into()],
@@ -451,6 +486,13 @@ mod tests {
     }
     fn plus(t: Timestamp, secs: i64) -> Timestamp {
         t + SignedDuration::from_secs(secs)
+    }
+    /// Constructed from the recorded single alert: only startsAt changes.
+    fn single_starting_at(starts_at: Timestamp) -> WebhookMessage {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&recorded("webhook-firing-single.json")).unwrap();
+        v["alerts"][0]["startsAt"] = starts_at.to_string().into();
+        serde_json::from_value(v).unwrap()
     }
     fn send_all(e: &mut Engine, fx: &Effects, now: Timestamp) {
         for o in &fx.publish {
@@ -911,6 +953,126 @@ mod tests {
         assert!(
             e.tick(plus(t0, 7500)).publish.is_empty(),
             "07:05 local: the loud repeat was just sent, nothing new due"
+        );
+    }
+
+    // Measured live 2026-09-14: Alertmanager 0.31.1 sets startsAt = endsAt
+    // for an alert posted with endsAt but no startsAt. A producer doing that
+    // (or one whose clock runs ahead) must not switch escalation off.
+    const DAY_AND_A_BIT: i64 = 26 * 3600;
+
+    #[test]
+    fn a_start_in_the_future_escalates_from_when_insist_first_saw_it() {
+        let mut e = engine();
+        let t0 = single().alerts[0].starts_at;
+        let w = single_starting_at(plus(t0, DAY_AND_A_BIT));
+
+        let fx = e.on_webhook(&w, t0);
+        assert_eq!(fx.publish.len(), 1);
+        assert_eq!(fx.publish[0].kind, Kind::Step(0, false));
+        send_all(&mut e, &fx, t0);
+
+        assert!(e.tick(plus(t0, 899)).publish.is_empty());
+        let fx = e.tick(plus(t0, 900));
+        assert_eq!(
+            fx.publish
+                .iter()
+                .map(|o| (o.kind.clone(), o.priority))
+                .collect::<Vec<_>>(),
+            vec![(Kind::Step(1, false), 5)],
+            "the critical ladder's step 1 is due 900 s after insist first saw it"
+        );
+        send_all(&mut e, &fx, plus(t0, 900));
+
+        let fx = e.tick(plus(t0, 3600));
+        assert_eq!(fx.publish[0].kind, Kind::Step(2, false));
+        assert_eq!(fx.raise.len(), 1);
+        assert_eq!(
+            fx.raise[0].minutes, 60,
+            "minutes unacknowledged count from first sight, never negative"
+        );
+    }
+
+    #[test]
+    fn the_message_of_a_future_start_names_when_insist_first_saw_it() {
+        let mut e = engine();
+        let t0 = single().alerts[0].starts_at; // 14:36 in Berlin
+        let fx = e.on_webhook(&single_starting_at(plus(t0, DAY_AND_A_BIT)), t0);
+        assert_eq!(
+            fx.publish[0].message,
+            "Unit lan6-set.service auf server ist rot (since 14:36)"
+        );
+    }
+
+    #[test]
+    fn a_start_before_insist_learned_of_it_still_counts_from_the_start() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        // Learned of ten minutes late (an outage, a restart).
+        let fx = e.on_webhook(&w, plus(t0, 600));
+        assert_eq!(fx.publish[0].kind, Kind::Step(0, false));
+        assert_eq!(
+            fx.publish[0].message,
+            "Unit lan6-set.service auf server ist rot (since 14:36)"
+        );
+        send_all(&mut e, &fx, plus(t0, 600));
+        assert!(e.tick(plus(t0, 899)).publish.is_empty());
+        assert_eq!(
+            e.tick(plus(t0, 900)).publish[0].kind,
+            Kind::Step(1, false),
+            "step 1 is due by the alert's own age, not by first sight"
+        );
+    }
+
+    #[test]
+    fn a_future_start_is_reported_once_per_instance() {
+        let mut e = engine();
+        let t0 = single().alerts[0].starts_at;
+        let future = plus(t0, DAY_AND_A_BIT);
+        let w = single_starting_at(future);
+
+        let fx = e.on_webhook(&w, t0);
+        assert_eq!(
+            fx.future_starts,
+            vec![FutureStart {
+                id: InstanceId::of(&w.alerts[0].fingerprint, future),
+                alertname: "UnitFehlgeschlagen".into(),
+                starts_at: future,
+                first_seen: t0,
+            }]
+        );
+        send_all(&mut e, &fx, t0);
+
+        // The same instance again, by every path that can meet it.
+        assert!(e.on_webhook(&w, plus(t0, 60)).future_starts.is_empty());
+        assert!(e.tick(plus(t0, 120)).future_starts.is_empty());
+        let mut active: Vec<GettableAlert> =
+            serde_json::from_str(&recorded("api-active.json")).unwrap();
+        let listed = active
+            .iter_mut()
+            .find(|a| a.fingerprint == w.alerts[0].fingerprint)
+            .unwrap();
+        listed.starts_at = future;
+        let fx = e.on_reconcile(&active, plus(t0, 180), plus(t0, 180));
+        assert!(fx.future_starts.is_empty(), "{:?}", fx.future_starts);
+        assert_eq!(e.open_instances(), active.len());
+    }
+
+    #[test]
+    fn a_start_at_most_a_minute_ahead_is_not_reported() {
+        let mut e = engine();
+        let t0 = single().alerts[0].starts_at;
+        assert!(e.on_webhook(&single(), t0).future_starts.is_empty());
+        assert!(e
+            .on_webhook(&single_starting_at(plus(t0, 60)), t0)
+            .future_starts
+            .is_empty());
+        assert_eq!(
+            e.on_webhook(&single_starting_at(plus(t0, 61)), t0)
+                .future_starts
+                .len(),
+            1
         );
     }
 }

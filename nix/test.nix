@@ -208,6 +208,8 @@ pkgs.testers.runNixOSTest {
         body = first["actions"][0]["body"]
         assert body.startswith("a1." + seq + "."), body
         assert messages("alarmtopic") == [], "a probe must not reach the alarm topic"
+        # A correct producer (startsAt sent) is never counted as a future start.
+        machine.succeed("curl -s http://127.0.0.1:9099/metrics | grep -qxF 'insist_future_starts_total 0'")
 
     with subtest("it escalates"):
         wait_for("alarmtopic-selbstprobe", 'any(.[]; .priority == 5)', 90)

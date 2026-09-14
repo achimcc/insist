@@ -1,4 +1,4 @@
-//! Prometheus text format, written by hand: eight numbers do not need a crate.
+//! Prometheus text format, written by hand: ten numbers do not need a crate.
 use jiff::Timestamp;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,10 @@ pub struct Metrics {
     /// that Alertmanager refused. A failed raise otherwise shows up only in
     /// the journal, and the alert it stands in for never fires.
     pub raise_failures_total: u64,
+    /// Instances first recorded with a startsAt more than a minute ahead
+    /// of insist's clock. They escalate from first sight instead; this
+    /// makes the producer's fault visible.
+    pub future_starts_total: u64,
     pub last_reconcile_success: Option<Timestamp>,
     pub last_publish_success: Option<Timestamp>,
     pub open_instances: u64,
@@ -71,6 +75,12 @@ impl Metrics {
             self.raise_failures_total.to_string(),
         );
         line(
+            "insist_future_starts_total",
+            "counter",
+            "Instances first seen with a startsAt more than a minute ahead of insist's clock.",
+            self.future_starts_total.to_string(),
+        );
+        line(
             "insist_open_instances",
             "gauge",
             "Instances neither acknowledged nor resolved.",
@@ -111,6 +121,7 @@ mod tests {
             "insist_state_corrupt_total",
             "insist_state_save_failures_total",
             "insist_raise_failures_total",
+            "insist_future_starts_total",
             "insist_open_instances",
             "insist_last_reconcile_success_timestamp_seconds",
             "insist_last_publish_success_timestamp_seconds",
@@ -118,5 +129,6 @@ mod tests {
             assert!(out.contains(name), "{name} missing from:\n{out}");
         }
         assert!(out.contains("insist_raise_failures_total 3"), "{out}");
+        assert!(out.contains("\ninsist_future_starts_total 0\n"), "{out}");
     }
 }

@@ -21,7 +21,9 @@ pub struct Instance {
     #[serde(default)]
     pub ends_at: Option<Timestamp>,
     /// When insist first learned of it. Reconciliation must not resolve an
-    /// instance it learned of after the API answer it is looking at was taken.
+    /// instance it learned of after the API answer it is looking at was taken,
+    /// and a `starts_at` in the future is aged from here instead (see
+    /// `effective_start`).
     pub first_seen: Timestamp,
     pub alertname: String,
     pub ladder: String,
@@ -41,6 +43,18 @@ pub struct Instance {
     /// "not quiet" (the safe reading: nothing owed beyond the normal ladder).
     #[serde(default)]
     pub last_quiet: bool,
+}
+
+impl Instance {
+    /// Where every age of this instance is measured from: its `startsAt`,
+    /// unless insist saw it earlier than that. A `startsAt` in the future
+    /// (a clock running ahead, or Alertmanager 0.31.1 filling an omitted
+    /// `startsAt` with `endsAt`) would otherwise hold the age at zero and
+    /// silence the ladder until that moment. For a correct producer
+    /// `first_seen` is never earlier, so nothing changes.
+    pub fn effective_start(&self) -> Timestamp {
+        self.starts_at.min(self.first_seen)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -143,6 +157,19 @@ mod tests {
         );
         s.ack_cursor = Some("hwQ2YpKdmg".into());
         s
+    }
+
+    #[test]
+    fn the_effective_start_is_the_earlier_of_starts_at_and_first_seen() {
+        let mut i = sample().instances.into_values().next().unwrap();
+        // A producer with a clock ahead (or Alertmanager filling an omitted
+        // startsAt with endsAt): escalation counts from when insist saw it.
+        i.first_seen = now();
+        i.starts_at = now() + jiff::SignedDuration::from_hours(26);
+        assert_eq!(i.effective_start(), now());
+        // Learned of late: the alert's own start still counts.
+        i.starts_at = now() - jiff::SignedDuration::from_mins(10);
+        assert_eq!(i.effective_start(), i.starts_at);
     }
 
     #[test]

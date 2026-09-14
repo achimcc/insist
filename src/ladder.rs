@@ -417,6 +417,8 @@ mod tests {
     }
 
     #[test]
+    // The primitive only: the engine never passes a future start here, it
+    // passes `Instance::effective_start` (at most first sight).
     fn a_start_in_the_future_counts_as_age_zero() {
         let now = ts("2026-09-11T15:54:00Z");
         let d = due(

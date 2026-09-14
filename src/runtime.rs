@@ -127,6 +127,16 @@ impl Runtime {
     /// every queued webhook behind it. The skipped sends stay due and are
     /// retried on the next tick.
     pub async fn process(&mut self, effects: Effects) -> usize {
+        for future in &effects.future_starts {
+            tracing::warn!(
+                "{} (instance {}) starts in the future: startsAt {}, first seen {}; escalating from first seen",
+                future.alertname,
+                future.id.as_str(),
+                future.starts_at,
+                future.first_seen
+            );
+            self.metrics.lock().unwrap().future_starts_total += 1;
+        }
         for raise in &effects.raise {
             let now = self.now();
             let mut labels = BTreeMap::new();
