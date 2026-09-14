@@ -68,10 +68,11 @@ the alert started, an optional repeat interval, and a priority to send at.
 paces — `critical` goes loud after fifteen minutes and, if still
 unacknowledged after an hour, additionally raises its own alert (see
 below); `warning` stays quiet for four hours, then repeats a loud reminder
-every twelve. Anything without a severity that matches a configured ladder
-— including a missing severity altogether, which is treated as `warning` —
-falls back to a single, stateless notice with no button and no further
-escalation.
+every twelve. An alert with no `severity` label at all is treated as
+`warning` and escalates on that ladder: a producer that forgot the label
+must not make its alert quieter. Only a severity that is set but matches no
+configured ladder (`info`, say) falls back to a single, stateless notice
+with no button and no further escalation.
 
 An instance the alerting system itself reports as suppressed (silenced or
 inhibited) is never escalated by insist for as long as that lasts —
@@ -146,15 +147,18 @@ outside.
 | Situation | What happens |
 |---|---|
 | insist is dead or restart-looping | No push notifications, but mail keeps working. Its watchdog ping stops, so the external dead man's switch raises the alarm from outside. |
+| A loop inside insist ends | Reconciliation, the tick and the acknowledgement stream each run forever. If one returns or panics, insist logs which one and exits with an error, and the service manager restarts it — it never goes on answering health checks and scrapes with a dead loop behind them. |
 | insist hangs | Its unit is `Type=notify` with a `WatchdogSec` timeout; a ping sent from the tick loop must arrive before that timeout, or the service manager kills and restarts it. |
 | The alerting system itself is down | The watchdog ping stops (dead man's switch again). Known instances keep escalating — they are never treated as resolved just because reconciliation cannot currently ask. |
+| The dead man's switch refuses the ping or cannot be reached | `/watchdog` answers 502, so the alerting system retries it. Every failed forward counts in `insist_watchdog_forward_failures_total`, and `insist_watchdog_last_success_timestamp_seconds` stops advancing; the switch's URL appears in no log line. If the pings stay away, the switch raises its own alarm from outside. |
 | The alerting API answers with an error | An error from that API is never read as "nothing is firing". Only an HTTP 200 with a valid JSON array of alerts counts as an answer; anything else leaves the last known state untouched, and the dead man's switch ping ages. |
 | The push service is down | Mail keeps working. A step counts as sent only once the push service actually accepts it; otherwise it stays due and is retried on the next tick. If an instance is still unacknowledged after about an hour, its "unacknowledged" alert still reaches mail on its own route regardless. |
-| The acknowledgement stream breaks | insist reconnects with backoff, resuming from its last saved cursor. A press that cannot be read yet simply has not been read yet: the instance keeps escalating exactly as if nobody had pressed anything. |
+| The acknowledgement stream breaks | insist reconnects with backoff, resuming from its last saved cursor. A press that cannot be read yet simply has not been read yet: the instance keeps escalating exactly as if nobody had pressed anything. Every line the push service sends on the stream, its periodic keepalives included, moves `insist_ack_stream_last_event_timestamp_seconds`; a stream that is gone without an error shows as that gauge no longer advancing. |
 | The state file is unreadable | It is moved aside with a timestamp in its name, a counter records that this happened, and insist starts again with an empty state. Every alert that is actually still firing announces itself again on the next reconciliation. |
 | insist restarts | Its state lives on disk, so a restart is not a fresh start: the first reconciliation after coming back up re-establishes every instance that is still firing, and the acknowledgement stream resumes from its saved cursor rather than replaying or skipping. |
 | A webhook body cannot be parsed | Unknown fields are ignored; a body that cannot be read at all answers with a server error, so the alerting system's own retry delivers it again. |
 | A silence ends while the alert underneath is still firing | The same instance simply continues escalating according to its own age — a silence ending is not a new event to it. |
+| An alert's `startsAt` lies in the future | Escalation is not switched off: every age is measured from the earlier of `startsAt` and the moment insist first saw the instance (see below). The first sighting more than a minute ahead logs one line and counts in `insist_future_starts_total`. |
 
 A single pass of due sends is itself bounded: once the push service stops
 answering entirely — as opposed to merely refusing one message — the
