@@ -30,6 +30,10 @@ pub struct Metrics {
     /// the journal — and as the switch's own alarm, much later.
     pub watchdog_forward_failures_total: u64,
     pub last_watchdog_success: Option<Timestamp>,
+    /// Last event line read from ntfy's acknowledgement stream, keepalives
+    /// included. ntfy sends a keepalive every 45 s by default; a value
+    /// older than a few intervals means acknowledgements are not being read.
+    pub ack_stream_last_event: Option<Timestamp>,
     pub last_reconcile_success: Option<Timestamp>,
     pub last_publish_success: Option<Timestamp>,
     pub open_instances: u64,
@@ -117,6 +121,12 @@ impl Metrics {
             "Last watchdog ping the dead man's switch accepted with a 2xx; 0 until the first.",
             seconds(self.last_watchdog_success),
         );
+        line(
+            "insist_ack_stream_last_event_timestamp_seconds",
+            "gauge",
+            "Last line read from ntfy's acknowledgement stream, keepalives included; 0 until the first.",
+            seconds(self.ack_stream_last_event),
+        );
         out
     }
 }
@@ -145,6 +155,7 @@ mod tests {
             "insist_last_publish_success_timestamp_seconds",
             "insist_watchdog_forward_failures_total",
             "insist_watchdog_last_success_timestamp_seconds",
+            "insist_ack_stream_last_event_timestamp_seconds",
         ] {
             assert!(out.contains(name), "{name} missing from:\n{out}");
         }

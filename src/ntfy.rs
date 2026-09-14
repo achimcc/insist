@@ -1,4 +1,5 @@
 //! Publishing to ntfy. Shapes follow fixtures/ntfy-2.26.0.
+use crate::metrics::MetricsHandle;
 use crate::secret::Secret;
 use serde_json::{json, Map, Value};
 use std::time::Duration;
@@ -113,12 +114,17 @@ impl NtfyClient {
     /// hands every message event to `tx`. Returns Ok when ntfy closes the
     /// connection; the caller reconnects. `idle` must exceed ntfy's keepalive
     /// interval (45 s by default) — silence longer than that is a dead link.
+    ///
+    /// Every event line ntfy sends, keepalives included, moves `seen`'s
+    /// `ack_stream_last_event`: a stream that stopped reading shows as a
+    /// gauge that stopped moving, not only as a journal line.
     pub async fn read_acks(
         &self,
         topic: &Secret,
         since: Option<&str>,
         idle: Duration,
         tx: &tokio::sync::mpsc::UnboundedSender<StreamLine>,
+        seen: &MetricsHandle,
     ) -> Result<(), StreamError> {
         let request = self
             .stream_http
@@ -143,10 +149,10 @@ impl NtfyClient {
             buffer.extend_from_slice(&chunk);
             while let Some(end) = buffer.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buffer.drain(..=end).collect();
-                deliver(&line, tx);
+                deliver(&line, tx, seen);
             }
         }
-        deliver(&buffer, tx);
+        deliver(&buffer, tx, seen);
         Ok(())
     }
 }
@@ -169,8 +175,9 @@ pub enum StreamError {
     Transport,
 }
 
-fn deliver(line: &[u8], tx: &tokio::sync::mpsc::UnboundedSender<StreamLine>) {
+fn deliver(line: &[u8], tx: &tokio::sync::mpsc::UnboundedSender<StreamLine>, seen: &MetricsHandle) {
     if let Ok(parsed) = serde_json::from_slice::<StreamLine>(line) {
+        seen.lock().unwrap().ack_stream_last_event = Some(jiff::Timestamp::now());
         if parsed.event == "message" {
             let _ = tx.send(parsed);
         }

@@ -80,12 +80,19 @@ async fn main() -> Result<()> {
         }
     });
     let s = shared.clone();
+    let seen = metrics.clone();
     tokio::spawn(async move {
         let mut backoff = 1u64;
         loop {
             let since = s.lock().await.engine.state().ack_cursor.clone();
             let result = ack_client
-                .read_acks(&ack_topic, since.as_deref(), Duration::from_secs(120), &tx)
+                .read_acks(
+                    &ack_topic,
+                    since.as_deref(),
+                    Duration::from_secs(120),
+                    &tx,
+                    &seen,
+                )
                 .await;
             match result {
                 Ok(()) => backoff = 1,

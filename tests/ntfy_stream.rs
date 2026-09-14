@@ -1,3 +1,4 @@
+use insist::metrics::MetricsHandle;
 use insist::ntfy::{NtfyClient, StreamError};
 use insist::secret::Secret;
 use std::time::Duration;
@@ -10,6 +11,10 @@ fn recorded(name: &str) -> String {
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap()
+}
+
+fn seen() -> MetricsHandle {
+    MetricsHandle::default()
 }
 
 fn topic() -> Secret {
@@ -31,6 +36,7 @@ async fn delivers_only_message_events_from_a_recorded_stream() {
         None,
         Duration::from_secs(5),
         &tx,
+        &seen(),
     )
     .await
     .unwrap();
@@ -54,9 +60,15 @@ async fn reads_the_recorded_button_bodies_with_the_token_and_since() {
         .await;
     let c = NtfyClient::new(&s.uri(), Secret::from("tk_alarm".to_string())).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    c.read_acks(&topic(), Some("hwQ2YpKdmg"), Duration::from_secs(5), &tx)
-        .await
-        .unwrap();
+    c.read_acks(
+        &topic(),
+        Some("hwQ2YpKdmg"),
+        Duration::from_secs(5),
+        &tx,
+        &seen(),
+    )
+    .await
+    .unwrap();
     drop(tx);
     let first = rx.recv().await.unwrap();
     assert_eq!(
@@ -77,7 +89,7 @@ async fn without_a_cursor_it_reads_everything_ntfy_still_holds() {
         .await;
     let c = NtfyClient::new(&s.uri(), Secret::from("tk".to_string())).unwrap();
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    c.read_acks(&topic(), None, Duration::from_secs(5), &tx)
+    c.read_acks(&topic(), None, Duration::from_secs(5), &tx, &seen())
         .await
         .unwrap();
     assert_eq!(
@@ -95,11 +107,13 @@ async fn a_403_and_a_silent_server_are_errors() {
         .await;
     let c = NtfyClient::new(&s.uri(), Secret::from("tk".to_string())).unwrap();
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let refused = seen();
     assert!(matches!(
-        c.read_acks(&topic(), None, Duration::from_secs(5), &tx)
+        c.read_acks(&topic(), None, Duration::from_secs(5), &tx, &refused)
             .await,
         Err(StreamError::Status(403))
     ));
+    assert!(refused.lock().unwrap().ack_stream_last_event.is_none());
 
     let s = MockServer::start().await;
     Mock::given(method("GET"))
@@ -108,8 +122,52 @@ async fn a_403_and_a_silent_server_are_errors() {
         .await;
     let c = NtfyClient::new(&s.uri(), Secret::from("tk".to_string())).unwrap();
     assert!(matches!(
-        c.read_acks(&topic(), None, Duration::from_millis(300), &tx)
+        c.read_acks(&topic(), None, Duration::from_millis(300), &tx, &seen())
             .await,
         Err(StreamError::Idle)
     ));
+}
+
+#[tokio::test]
+async fn every_line_moves_the_stream_gauge_keepalives_included() {
+    // Only the keepalive lines of the recording (ntfy 2.26.0 with
+    // keepalive-interval 5s): no message at all, and still proof of life.
+    let keepalives: String = recorded("stream.ndjson")
+        .lines()
+        .filter(|l| l.contains("\"event\":\"keepalive\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(keepalives.lines().count(), 2, "{keepalives}");
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(keepalives))
+        .mount(&s)
+        .await;
+    let c = NtfyClient::new(&s.uri(), Secret::from("tk".to_string())).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let metrics = seen();
+    let before = jiff::Timestamp::now().as_second();
+    c.read_acks(&topic(), None, Duration::from_secs(5), &tx, &metrics)
+        .await
+        .unwrap();
+    let after = jiff::Timestamp::now().as_second();
+    drop(tx);
+    assert!(rx.recv().await.is_none(), "a keepalive is not a message");
+    let last = metrics
+        .lock()
+        .unwrap()
+        .ack_stream_last_event
+        .expect("a keepalive must set the gauge")
+        .as_second();
+    assert!(
+        before <= last && last <= after,
+        "{before} <= {last} <= {after}"
+    );
+    let rendered = metrics.lock().unwrap().render();
+    assert!(
+        rendered.contains(&format!(
+            "\ninsist_ack_stream_last_event_timestamp_seconds {last}\n"
+        )),
+        "{rendered}"
+    );
 }
