@@ -108,3 +108,7 @@ services.insist = {
 - **No web UI.** The only way to acknowledge an alert is the button in the
   push notification. There is no page to click through, and none is
   planned.
+
+## Deployed at
+
+Running in the author's homeserver (an obs-01 guest) since 2026-09-14, v0.2.1.
