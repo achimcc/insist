@@ -287,6 +287,10 @@ impl Engine {
         // alerts re-posted yet, the API answers 200 []. Absence resolves an
         // instance only once its last known endsAt has passed — otherwise a
         // restart during an outage would announce a false all-clear.
+        // Measured on the live deployment: restarting the Alertmanager/
+        // Prometheus host re-fires every rule with a new startsAt, so this
+        // is a new instance, not a resend of the old one — the old one just
+        // resolves here once its endsAt passes, unacknowledged.
         for (id, instance) in self.state.instances.iter_mut() {
             if instance.resolved_at.is_none()
                 && !present.contains(id)

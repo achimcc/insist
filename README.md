@@ -111,4 +111,4 @@ services.insist = {
 
 ## Deployed at
 
-Running in the author's homeserver (an obs-01 guest) since 2026-09-14, v0.2.1.
+Running in the author's homeserver (an obs-01 guest) since 2026-09-14, v0.2.2.

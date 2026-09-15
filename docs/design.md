@@ -60,6 +60,17 @@ wait for, so its absence resolves it at once; the waiting is specifically
 for instances whose known end time gives a reason not to conclude anything
 yet.
 
+Measured on the live deployment: when the Alertmanager/Prometheus host
+itself restarts, Prometheus re-evaluates every rule and re-sends each
+firing alert with a new `startsAt` (`FiredAt` is reset for every rule), not
+just an empty list followed by a resend of the same one. insist therefore
+sees a new instance under the identity above: the phone rings again, the
+old instance is later read as resolved once its `endsAt` passes, an
+acknowledgement made on it does not carry over to the new one, and the
+unacknowledged-mail deadline restarts from zero. Carrying state per
+fingerprint instead of per instance would avoid this and is a possible
+future change.
+
 ## Ladders and night
 
 Each severity has its own ladder: a table of steps, each with a delay since
