@@ -2,9 +2,15 @@
   description = "Keep alerts open and escalating until a human acknowledges them";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  # The RustSec advisory database, pinned like any other input. The `audit`
+  # check reads it offline; `nix flake update advisory-db` brings news in.
+  inputs.advisory-db = {
+    url = "github:rustsec/advisory-db";
+    flake = false;
+  };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, advisory-db }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
@@ -53,6 +59,13 @@
           buildPhase = "cargo fmt --check";
           installPhase = "touch $out";
         });
+        # Known advisories against Cargo.lock. RUSTSEC-2026-0285 (rustls) sat in
+        # the deployed binary for four days before an audit found it by hand;
+        # this is the check that would have said so.
+        audit = pkgs.runCommand "insist-audit" { nativeBuildInputs = [ pkgs.cargo-audit ]; } ''
+          HOME=$TMPDIR cargo-audit audit --no-fetch --db ${advisory-db} --file ${./Cargo.lock}
+          touch $out
+        '';
         vm = import ./nix/test.nix {
           inherit pkgs;
           module = self.nixosModules.default;
