@@ -3,8 +3,9 @@ use axum::http::{Request, StatusCode};
 use insist::config::Config;
 use insist::metrics::MetricsHandle;
 use insist::runtime::{Clock, Runtime};
+use insist::secret::Secret;
 use insist::secrets::Secrets;
-use insist::server::{router, App, Shared};
+use insist::server::{router, App, Shared, WebhookToken};
 use insist::state::{Loaded, State};
 use jiff::{SignedDuration, Timestamp};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -12,6 +13,9 @@ use std::time::Duration;
 use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// The bearer token every authenticated call in these tests carries.
+const TEST_TOKEN: &str = "tk_test_webhook_token";
 
 fn recorded(name: &str) -> String {
     std::fs::read_to_string(format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
@@ -59,7 +63,7 @@ impl World {
             );
         let config = Config::from_toml(&toml).unwrap();
         let secrets = Secrets::parse(&format!(
-            "NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=tk_alarm\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=3f9a0c1e5b7d2f4a\nWATCHDOG_URL={}\n",
+            "NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=tk_alarm\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=3f9a0c1e5b7d2f4a\nWATCHDOG_URL={}\nWEBHOOK_TOKEN={TEST_TOKEN}\n",
             watchdog_url.unwrap_or_else(|| format!("{}/ping/x", dog.uri()))
         ))
         .unwrap();
@@ -90,6 +94,7 @@ impl World {
         App {
             runtime: self.runtime.clone(),
             metrics: self.metrics.clone(),
+            webhook_token: WebhookToken(Secret::from(TEST_TOKEN.to_string())),
         }
     }
 
@@ -98,7 +103,20 @@ impl World {
         *n += SignedDuration::from_secs(secs);
     }
 
-    async fn call(&self, req: Request<Body>) -> (StatusCode, String) {
+    /// Carries the bearer token, because that is the normal case for every
+    /// caller insist has: Alertmanager's four receivers and the watchdog
+    /// forward. The tests that check the guard itself use
+    /// `call_unauthenticated`, so a missing token is always deliberate and
+    /// visible at the call site.
+    async fn call(&self, mut req: Request<Body>) -> (StatusCode, String) {
+        req.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {TEST_TOKEN}").parse().unwrap(),
+        );
+        self.call_unauthenticated(req).await
+    }
+
+    async fn call_unauthenticated(&self, req: Request<Body>) -> (StatusCode, String) {
         let res = router(self.app()).oneshot(req).await.unwrap();
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
@@ -330,7 +348,7 @@ async fn a_hanging_ntfy_bounds_the_pass_to_one_attempt_and_marks_the_rest_pendin
         );
     let config = Config::from_toml(&toml).unwrap();
     let secrets = Secrets::parse(&format!(
-        "NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=tk_alarm\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=3f9a0c1e5b7d2f4a\nWATCHDOG_URL={}/ping/x\n",
+        "NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=tk_alarm\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=3f9a0c1e5b7d2f4a\nWATCHDOG_URL={}/ping/x\nWEBHOOK_TOKEN={TEST_TOKEN}\n",
         dog.uri()
     ))
     .unwrap();
@@ -672,4 +690,111 @@ async fn an_unreachable_dead_mans_switch_is_counted_and_never_named() {
         metric(&m, "insist_watchdog_last_success_timestamp_seconds"),
         "0"
     );
+}
+
+// --- B41: the webhook and the watchdog are authenticated. ---
+//
+// Without a token, a `POST /` carrying `status: resolved` and a known
+// fingerprint deletes the instance; `reconcile` recreates it 60 s later at
+// stage 0, so stage 2 and the unacknowledged-alarm mail are never reached.
+// Anyone who reaches obs-01 on loopback can hold the escalation down for as
+// long as they like, and the fingerprint is readable at the Alertmanager
+// (B15). `POST /watchdog` with any body at all pinged the dead man's switch,
+// which is the one signal that says this machine is still alive.
+
+#[tokio::test]
+async fn a_webhook_without_a_token_is_refused() {
+    let w = World::new(200).await;
+    let (code, _) = w
+        .call_unauthenticated(
+            Request::post("/")
+                .header("content-type", "application/json")
+                .body(Body::from(recorded(
+                    "alertmanager-0.31.1/webhook-firing-single.json",
+                )))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+    assert!(
+        w.published().await.is_empty(),
+        "an unauthenticated webhook must not publish"
+    );
+}
+
+#[tokio::test]
+async fn a_webhook_with_a_wrong_token_is_refused() {
+    let w = World::new(200).await;
+    for wrong in [
+        "Bearer ",
+        "Bearer wrong",
+        // A prefix of the real token: `Secret::matches` compares in constant
+        // time, and a length check alone would let this through.
+        "Bearer tk_test_webhoo",
+        // The right value, wrong scheme.
+        &format!("Basic {TEST_TOKEN}"),
+        // The right value, no scheme at all.
+        TEST_TOKEN,
+    ] {
+        let (code, _) = w
+            .call_unauthenticated(
+                Request::post("/watchdog")
+                    .header(axum::http::header::AUTHORIZATION, wrong)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "accepted {wrong:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_watchdog_ping_without_a_token_is_refused_and_forwards_nothing() {
+    let w = World::new(200).await;
+    let (code, _) = w
+        .call_unauthenticated(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+    assert!(
+        w.dog.received_requests().await.unwrap().is_empty(),
+        "an unauthenticated ping must not reach the dead man's switch"
+    );
+}
+
+/// The guard runs BEFORE the handler, so a refusal says nothing about the
+/// state behind it. Without a good reconcile `/watchdog` answers 503; an
+/// unauthenticated caller must not be able to tell that apart from 401 and
+/// learn whether reconciliation is running.
+#[tokio::test]
+async fn the_refusal_does_not_leak_whether_reconciliation_is_fresh() {
+    let w = World::new(200).await;
+    let stale = w
+        .call_unauthenticated(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await
+        .0;
+    good_reconcile(&w).await;
+    let fresh = w
+        .call_unauthenticated(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await
+        .0;
+    assert_eq!(stale, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        fresh,
+        StatusCode::UNAUTHORIZED,
+        "the answer must not differ"
+    );
+}
+
+/// `/metrics` and `/health` must stay open: Prometheus and systemd carry no
+/// credential. If the guard ever spreads to them, scraping dies quietly and
+/// the dashboards go empty rather than red.
+#[tokio::test]
+async fn the_reading_endpoints_stay_open() {
+    let w = World::new(200).await;
+    for path in ["/metrics", "/health"] {
+        let (code, _) = w
+            .call_unauthenticated(Request::get(path).body(Body::empty()).unwrap())
+            .await;
+        assert_eq!(code, StatusCode::OK, "{path} must not need a token");
+    }
 }

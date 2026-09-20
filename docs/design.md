@@ -32,6 +32,39 @@ itself is one JSON body to the push service, title included — not a title
 carried in a transport header, which would otherwise have constrained every
 alert title to a header-safe character set.
 
+## Who may write
+
+The two endpoints that change state — `POST /` and `POST /watchdog` — demand
+`Authorization: Bearer <WEBHOOK_TOKEN>`. The two that only read, `/metrics`
+and `/health`, stay open, because Prometheus and systemd carry no credential
+and a guard there would end scraping quietly.
+
+Being bound to loopback was not enough, and the reason is worth keeping:
+a forged `POST /` with `status: resolved` and a known fingerprint deleted the
+instance, and reconciliation recreated it 60 s later **at step 0**. Repeated,
+that holds an alert below step 2 and below the unacknowledged-alarm mail
+forever — the escalation looks alive the whole time, because it keeps
+starting. The fingerprint is not a secret either; it is readable at the
+Alertmanager. A forged `POST /watchdog` was worse in a quieter way: any body
+at all pinged the dead man's switch, which is the one signal that claims this
+machine is still alive.
+
+**401 and never 5xx.** Alertmanager retries a 5xx, and no retry fixes a wrong
+token; answering 5xx would turn one rejected delivery into an endless stream.
+The refusal also happens *before* the handler, so its status says nothing
+about the state behind it — `/watchdog` answers 503 when reconciliation has
+gone stale, and an unauthenticated caller must not be able to tell 503 from
+401 and learn whether reconciliation is running.
+
+The comparison is `Secret::matches`, which is constant-time: a plain `==`
+returns at the first differing byte and leaks the prefix to anyone who can
+time the answer.
+
+The split is two routers rather than a check inside each handler. A new
+endpoint then has to be put on one side or the other, and that choice shows
+up in the diff; a line inside a handler is a line the next handler can be
+written without.
+
 ## Instances
 
 An instance is identified by Alertmanager's fingerprint together with its

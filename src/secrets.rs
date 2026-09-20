@@ -17,6 +17,11 @@ pub struct Secrets {
     pub ack_key: Secret,
     /// The external dead man's switch. Its URL is its credential.
     pub watchdog_url: Secret,
+    /// The bearer token `POST /` and `POST /watchdog` demand. Without it a
+    /// forged `resolved` deletes an instance and holds the escalation at
+    /// stage 0 forever, and any body at all pings the dead man's switch
+    /// (audit B41).
+    pub webhook_token: Secret,
 }
 
 impl Secrets {
@@ -50,6 +55,7 @@ impl Secrets {
             button_token: take("NTFY_BUTTON_TOKEN")?,
             ack_key: take("ACK_HMAC_KEY")?,
             watchdog_url: take("WATCHDOG_URL")?,
+            webhook_token: take("WEBHOOK_TOKEN")?,
         })
     }
 }
@@ -58,7 +64,7 @@ impl Secrets {
 mod tests {
     use super::Secrets;
 
-    const FULL: &str = "NTFY_TOPIC=alarme-xyz\nNTFY_TOKEN=tk_abc\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=00ff\nWATCHDOG_URL=https://hc.example/ping/geheim\n";
+    const FULL: &str = "NTFY_TOPIC=alarme-xyz\nNTFY_TOKEN=tk_abc\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=00ff\nWATCHDOG_URL=https://hc.example/ping/geheim\nWEBHOOK_TOKEN=tk_hook\n";
 
     #[test]
     fn parses_key_value_lines_and_ignores_comments() {
@@ -82,11 +88,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_five_keys() {
+    fn parses_all_six_keys() {
         let s = Secrets::parse(FULL).unwrap();
         assert_eq!(s.button_token.expose(), "tk_knopf");
         assert_eq!(s.ack_key.expose(), "00ff");
         assert_eq!(s.watchdog_url.expose(), "https://hc.example/ping/geheim");
+        assert_eq!(s.webhook_token.expose(), "tk_hook");
     }
 
     #[test]
@@ -97,6 +104,7 @@ mod tests {
             "NTFY_BUTTON_TOKEN",
             "ACK_HMAC_KEY",
             "WATCHDOG_URL",
+            "WEBHOOK_TOKEN",
         ] {
             let without: String = FULL
                 .lines()

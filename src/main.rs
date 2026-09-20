@@ -3,7 +3,7 @@ use insist::config::Config;
 use insist::runtime::{system_clock, Runtime};
 use insist::secret::Secret;
 use insist::secrets::Secrets;
-use insist::server::{router, App, Shared};
+use insist::server::{router, App, Shared, WebhookToken};
 use insist::state::State;
 use insist::tasks::{run_tasks, Tasks};
 use std::sync::Arc;
@@ -38,6 +38,10 @@ async fn main() -> Result<()> {
         Secret::from(secrets.token.expose().to_string()),
     )?;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    // Copied out for the same reason as `ack_client` above: the runtime takes
+    // `secrets` on the next line, and the HTTP guard needs the token without
+    // reaching through the runtime lock (audit B41).
+    let webhook_token = WebhookToken(Secret::from(secrets.webhook_token.expose().to_string()));
     let runtime = Runtime::new(config, secrets, loaded, system_clock())?;
     let metrics = runtime.metrics_handle();
     let shared: Shared = Arc::new(tokio::sync::Mutex::new(runtime));
@@ -114,6 +118,7 @@ async fn main() -> Result<()> {
         router(App {
             runtime: shared,
             metrics,
+            webhook_token,
         }),
     )
     .with_graceful_shutdown(async {
