@@ -409,6 +409,92 @@ async fn metrics_answers_even_while_the_runtime_lock_is_held() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+/// A storm must not be multiplied by the number of webhooks that carry it.
+///
+/// Audit finding B42, measured on 2026-09-14 against a fake ntfy answering
+/// 429: `insist_publish_failures_total` reached **128100 in 100 seconds**
+/// from around 500 alerts. Every webhook ends with a `tick`, a `tick` offers
+/// every open instance that is due, and a failed publish leaves `last_sent`
+/// alone — so every instance stayed due and was retried by every later
+/// webhook. N alerts arriving as N webhooks cost N² requests, and they cost
+/// them at exactly the moment ntfy is already saying it has had enough.
+///
+/// `Transport` already stopped a pass (an unreachable ntfy would otherwise
+/// hold the runtime lock for `N * 10s`). A 429 is the same statement made
+/// quickly: the answer is about ntfy, not about this one message, so the rest
+/// of the pass will get it too.
+#[tokio::test]
+async fn a_refused_pass_stops_instead_of_asking_for_every_open_instance() {
+    let w = World::new(429).await;
+    let storm = a_storm_of(20);
+
+    for _ in 0..2 {
+        w.call(
+            Request::post("/")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&storm).unwrap()))
+                .unwrap(),
+        )
+        .await;
+    }
+
+    let attempts = w.ntfy.received_requests().await.unwrap().len();
+    assert!(
+        attempts <= 2,
+        "{attempts} requests for two webhooks: ntfy said 429 and was asked again anyway"
+    );
+
+    // And nothing was quietly dropped: every instance is still owed.
+    let (_, metrics) = w
+        .call(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await;
+    assert!(metrics.contains("insist_publish_pending 20"), "{metrics}");
+    assert!(metrics.contains("insist_open_instances 20"), "{metrics}");
+}
+
+/// A 4xx that is about THIS message must not stop the pass — otherwise one
+/// malformed notification holds up every other alert in the house. Only the
+/// answers that are about ntfy itself do (429 and 5xx).
+#[tokio::test]
+async fn a_refusal_of_one_message_does_not_stop_the_others() {
+    let w = World::new(400).await;
+    let storm = a_storm_of(5);
+
+    w.call(
+        Request::post("/")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&storm).unwrap()))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(
+        w.ntfy.received_requests().await.unwrap().len(),
+        5,
+        "a 400 is about the one message, so the rest must still be offered"
+    );
+}
+
+/// `count` firing alerts in one webhook, each its own instance.
+///
+/// The SHAPE is the recorded answer; only the fingerprint and the instance
+/// label vary, because an `InstanceId` is a fingerprint plus a `startsAt`.
+fn a_storm_of(count: usize) -> serde_json::Value {
+    let mut v: serde_json::Value =
+        serde_json::from_str(&recorded("alertmanager-0.31.1/webhook-firing-single.json")).unwrap();
+    let one = v["alerts"][0].clone();
+    let alerts: Vec<serde_json::Value> = (0..count)
+        .map(|i| {
+            let mut a = one.clone();
+            a["fingerprint"] = format!("{:016x}", 0x51_0000_0000_u64 + i as u64).into();
+            a["labels"]["instance"] = format!("host{i}").into();
+            a
+        })
+        .collect();
+    v["alerts"] = alerts.into();
+    v
+}
+
 #[tokio::test]
 async fn a_once_alert_with_ntfy_failing_fails_the_webhook() {
     let w = World::new(500).await;

@@ -119,13 +119,9 @@ impl Runtime {
     ///
     /// Raises go out before publishes: the "unacknowledged" mail must reach
     /// Alertmanager even when ntfy is hanging and the publish loop below
-    /// stops partway through. And a publish loop that hits a `Transport`
-    /// error (ntfy unreachable or timing out, not merely refusing) halts
-    /// for the rest of this pass instead of trying every remaining send at
-    /// up to 10 s each: with N due sends that would hold the one runtime
-    /// lock for up to `N * 10s`, starving `/watchdog`, reconciliation and
-    /// every queued webhook behind it. The skipped sends stay due and are
-    /// retried on the next tick.
+    /// stops partway through. And a publish loop that hits an answer about
+    /// ntfy ITSELF halts for the rest of this pass (see `halts_the_pass`);
+    /// the skipped sends stay due and are retried on the next tick.
     pub async fn process(&mut self, effects: Effects) -> usize {
         for future in &effects.future_starts {
             tracing::warn!(
@@ -205,10 +201,7 @@ impl Runtime {
                     if out.kind == Kind::Once {
                         failed_once += 1;
                     }
-                    // A Status(_) answer is fast (ntfy is up and refused);
-                    // only an unreachable-or-hanging Transport bounds the
-                    // rest of this pass.
-                    if matches!(e, PublishError::Transport) {
+                    if halts_the_pass(&e) {
                         halted = true;
                     }
                 }
@@ -307,6 +300,53 @@ impl Runtime {
             metrics: self.metrics.clone(),
             clock: self.clock.clone(),
         })
+    }
+}
+
+/// Does this failure say something about **ntfy**, or about this one message?
+///
+/// An answer about ntfy will be the same answer for every remaining send in
+/// the pass, so asking again is at best pointless and at worst the thing that
+/// keeps ntfy down. An answer about one message must not hold up the others,
+/// or one malformed notification silences the whole house.
+///
+/// * `Transport` — unreachable or hanging. Already halted before 0.2.4, and
+///   for a second reason: with N due sends at up to 10 s each, one pass would
+///   hold the single runtime lock for `N * 10s` and starve `/watchdog`,
+///   reconciliation and every queued webhook behind it.
+/// * **429** — ntfy has said it has had enough. Audit finding B42: every
+///   webhook ends with a `tick`, a `tick` offers every open instance that is
+///   due, and a failed publish leaves `last_sent` alone. So each webhook
+///   retried every earlier alert, and a storm of around 500 became
+///   **128100 requests in 100 seconds** — measured on 2026-09-14, against an
+///   ntfy that was already rate-limiting. The amplification arrives exactly
+///   when it hurts most.
+/// * **5xx** — ntfy is broken, not this message.
+///
+/// Everything else (a 400, a 413, a 401) is about the one notification and
+/// leaves the pass running.
+///
+/// ## What B42 also proposed, and why it is deliberately not here
+///
+/// The finding asked for a per-instance backoff on top of this. It was
+/// written while the quadratic blowup was the observed harm, and the halt
+/// above removes that: with `tick_secs = 15`, a refusing ntfy now costs
+/// **one** POST every fifteen seconds, whatever the number of open
+/// instances. That is not a storm — it is a notification system waiting for
+/// its transport, and 15 s is how long it then takes to deliver once ntfy
+/// comes back.
+///
+/// A backoff would trade exactly that away: it would delay the first
+/// delivery after a recovery, on purpose, for a saving this halt has already
+/// made. The first rule of this program is that it must never make the alert
+/// path weaker, and a critical alert arriving late because insist decided to
+/// wait is precisely that. If a per-visitor budget ever turns out to need
+/// more, the number to change is `tick_secs`, which is configuration and
+/// does not touch the escalation ladder at all.
+fn halts_the_pass(e: &PublishError) -> bool {
+    match e {
+        PublishError::Transport => true,
+        PublishError::Status(code) => *code == 429 || (500..600).contains(code),
     }
 }
 

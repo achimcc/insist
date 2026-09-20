@@ -171,13 +171,35 @@ outside.
 | A silence ends while the alert underneath is still firing | The same instance simply continues escalating according to its own age — a silence ending is not a new event to it. |
 | An alert's `startsAt` lies in the future | Escalation is not switched off: every age is measured from the earlier of `startsAt` and the moment insist first saw the instance (see below). The first sighting more than a minute ahead logs one line and counts in `insist_future_starts_total`. |
 
-A single pass of due sends is itself bounded: once the push service stops
-answering entirely — as opposed to merely refusing one message — the
+A single pass of due sends is itself bounded: once the push service says
+something about **itself** — as opposed to refusing one message — the
 remaining sends in that pass are left for the next one, rather than each
 waiting out its own multi-second timeout in turn. Without that bound, a
 push service that merely hangs could hold the pass open long enough for
 insist's own watchdog to kill it — turning a service that is only waiting
-on a slow network call into one that gets restarted for it. Every send in
+on a slow network call into one that gets restarted for it.
+
+Since 0.2.4 that bound covers a refusal that is about the service as well:
+**429 and 5xx**, not only an unreachable one. The reason is a measurement,
+not a tidiness argument. Every webhook ends with a tick, a tick offers every
+open instance that is due, and a failed send leaves `last_sent` alone — so
+before 0.2.4 each webhook in a storm retried every alert that had arrived
+before it. Against a fake push service answering 429, around 500 alerts
+became **128100 requests in 100 seconds**: the amplification arrived exactly
+when the service was already saying it had had enough. With the bound, a
+refusing service costs one request per tick, whatever the number of open
+instances.
+
+A refusal that is about **one message** (a 400, a 413, a 401) deliberately
+does not halt the pass. One malformed notification must not hold up every
+other alert in the house — that would be the amplification's mirror image,
+a single bad message silencing everything.
+
+The deliberate non-feature here is a per-instance backoff. With the bound in
+place, a refusing service already costs one request per tick; a backoff would
+only add delay to the first delivery after it recovers. This program must
+never make the alert path weaker, and an alert arriving late because insist
+decided to wait is exactly that. Every send in
 a pass that did not succeed — whether left over because the pass was
 already halted, or attempted and refused by the push service itself — is
 counted in the `insist_publish_pending` metric; an external alert watching
