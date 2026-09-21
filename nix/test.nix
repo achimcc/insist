@@ -45,7 +45,11 @@ pkgs.testers.runNixOSTest {
           - "alarm:alarmtopic*:rw"
           - "knopf:alarmtopic-quittung:write-only"
         EOF
-        printf 'NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=%s\nNTFY_BUTTON_TOKEN=%s\nACK_HMAC_KEY=%s\nWATCHDOG_URL=http://127.0.0.1:8099/ping\n' \
+        # WEBHOOK_TOKEN since 0.2.5: without it insist refuses to start —
+        # which is what this test caught when 0.3.0 was prepared, so 0.2.5
+        # had been tagged with it red. Fixed, not random: Alertmanager's
+        # config below has to name the same value, and the VM dies with it.
+        printf 'NTFY_TOPIC=alarmtopic\nNTFY_TOKEN=%s\nNTFY_BUTTON_TOKEN=%s\nACK_HMAC_KEY=%s\nWATCHDOG_URL=http://127.0.0.1:8099/ping\nWEBHOOK_TOKEN=tk_vm_webhook\n' \
           "$alarm" "$knopf" "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > /run/ntfy-test/insist-env
         chmod 0400 /run/ntfy-test/insist-env
       '';
@@ -109,8 +113,8 @@ pkgs.testers.runNixOSTest {
           ];
         };
         receivers = [
-          { name = "insist"; webhook_configs = [ { url = "http://127.0.0.1:9099/"; send_resolved = true; } ]; }
-          { name = "insist-watchdog"; webhook_configs = [ { url = "http://127.0.0.1:9099/watchdog"; send_resolved = false; } ]; }
+          { name = "insist"; webhook_configs = [ { url = "http://127.0.0.1:9099/"; send_resolved = true; http_config.authorization.credentials = "tk_vm_webhook"; } ]; }
+          { name = "insist-watchdog"; webhook_configs = [ { url = "http://127.0.0.1:9099/watchdog"; send_resolved = false; http_config.authorization.credentials = "tk_vm_webhook"; } ]; }
         ];
       };
     };
@@ -303,10 +307,23 @@ pkgs.testers.runNixOSTest {
         post_alert({"alertname": "Watchdog", "severity": "none"}, iso("now"), iso("+10 minutes"))
         machine.wait_until_succeeds("test -s /tmp/pings", timeout=60)
 
+    with subtest("an active silence reaches ntfy directly, once"):
+        # Audit finding B15 of the homeserver: a silence mutes alerts inside
+        # Alertmanager, so the notice must not travel through it.
+        body = json.dumps({"matchers": [{"name": "alertname", "value": ".+", "isRegex": True, "isEqual": True}],
+                           "startsAt": iso("now"), "endsAt": iso("+1 hour"), "createdBy": "vm-test", "comment": "everything"})
+        machine.succeed(f"curl -sf -X POST -H 'Content-Type: application/json' --data '{body}' http://127.0.0.1:9093/api/v2/silences")
+        wait_for("alarmtopic", 'any(.[]; ((.title // "") | test("alertname=~")) and .priority == 5)', 30)
+        machine.wait_until_succeeds("curl -s http://127.0.0.1:9099/metrics | grep -qxF 'insist_silences_active 1'", timeout=30)
+        # Three more passes (reconcile_secs = 3): still exactly one notice.
+        machine.sleep(10)
+        told = [m for m in messages("alarmtopic") if "alertname=~" in m.get("title", "")]
+        assert len(told) == 1, told
+
     with subtest("without Alertmanager the ping is withheld"):
         machine.systemctl("stop alertmanager.service")
         machine.sleep(25)
-        code = machine.succeed("curl -s -o /dev/null -w '%{http_code}' -X POST --data '{}' http://127.0.0.1:9099/watchdog").strip()
+        code = machine.succeed("curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer tk_vm_webhook' --data '{}' http://127.0.0.1:9099/watchdog").strip()
         assert code == "503", code
 
     with subtest("the systemd watchdog itself never had to restart insist"):
