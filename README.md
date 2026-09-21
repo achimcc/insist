@@ -6,6 +6,11 @@ insist sits behind Prometheus Alertmanager, sends each alert to ntfy with an
 "Acknowledge" button, and repeats it louder until the button is pressed or
 Alertmanager resolves the alert. Mail is never routed through it.
 
+It also reads Alertmanager's silences on every reconciliation and tells ntfy
+once about each one that becomes active — directly, not through
+Alertmanager's routing, because a silence is exactly what would mute a rule
+inside Alertmanager that watched for silences.
+
 See [`docs/design.md`](docs/design.md) for the design.
 
 Licence: AGPL-3.0-only.
@@ -111,4 +116,4 @@ services.insist = {
 
 ## Deployed at
 
-Running in the author's homeserver (an obs-01 guest) since 2026-09-14, v0.2.5.
+Running in the author's homeserver (an obs-01 guest) since 2026-09-14, v0.3.0.

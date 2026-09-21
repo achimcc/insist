@@ -55,6 +55,68 @@ pub struct Receiver {
     pub name: String,
 }
 
+/// A silence as `GET /api/v2/silences` lists it (recorded in
+/// `silences-*.json`). Expired silences stay in that list, so only
+/// `status.state == "active"` means one is muting something right now.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GettableSilence {
+    pub id: String,
+    pub status: SilenceStatus,
+    pub matchers: Vec<Matcher>,
+    pub starts_at: Timestamp,
+    pub ends_at: Timestamp,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub comment: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SilenceStatus {
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Matcher {
+    pub name: String,
+    pub value: String,
+    pub is_regex: bool,
+    /// Absent in answers from before Alertmanager knew negative matchers;
+    /// absent means equal.
+    #[serde(default = "yes")]
+    pub is_equal: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl GettableSilence {
+    pub fn is_active(&self) -> bool {
+        self.status.state == "active"
+    }
+
+    /// The matchers the way Alertmanager's own UI writes them:
+    /// `alertname=~".+", instance!="server"`.
+    pub fn matchers_text(&self) -> String {
+        self.matchers
+            .iter()
+            .map(|m| {
+                let op = match (m.is_equal, m.is_regex) {
+                    (true, false) => "=",
+                    (false, false) => "!=",
+                    (true, true) => "=~",
+                    (false, true) => "!~",
+                };
+                format!("{}{op}\"{}\"", m.name, m.value)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Alertmanager writes exactly this value into `endsAt` for a firing alert
 /// that has no resolve timeout yet (every recorded firing webhook carries
 /// it); it is not a real deadline.
@@ -83,7 +145,7 @@ pub struct PostableAlert {
 pub enum ApiError {
     #[error("Alertmanager answered HTTP {0}")]
     Status(u16),
-    #[error("Alertmanager's answer is not a list of alerts")]
+    #[error("Alertmanager's answer is not the list it should be")]
     Malformed,
     #[error("Alertmanager could not be reached")]
     Transport,
@@ -110,6 +172,22 @@ impl AlertmanagerClient {
         let answer = self
             .http
             .get(format!("{}/api/v2/alerts", self.base))
+            .send()
+            .await
+            .map_err(|_| ApiError::Transport)?;
+        if answer.status().as_u16() != 200 {
+            return Err(ApiError::Status(answer.status().as_u16()));
+        }
+        let bytes = answer.bytes().await.map_err(|_| ApiError::Transport)?;
+        serde_json::from_slice(&bytes).map_err(|_| ApiError::Malformed)
+    }
+
+    /// Same rule as `alerts`: only a 200 with a JSON array is an answer. An
+    /// error is never "no silence is active".
+    pub async fn silences(&self) -> Result<Vec<GettableSilence>, ApiError> {
+        let answer = self
+            .http
+            .get(format!("{}/api/v2/silences", self.base))
             .send()
             .await
             .map_err(|_| ApiError::Transport)?;
@@ -190,6 +268,34 @@ mod tests {
         assert!(suppressed.iter().any(|a| a.status.state == "suppressed"));
         let empty: Vec<GettableAlert> = serde_json::from_str(&fixture("api-empty.json")).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn reads_the_recorded_silences_and_counts_only_active_ones() {
+        let empty: Vec<GettableSilence> =
+            serde_json::from_str(&fixture("silences-empty.json")).unwrap();
+        assert!(empty.is_empty());
+
+        let both: Vec<GettableSilence> =
+            serde_json::from_str(&fixture("silences-active-and-pending.json")).unwrap();
+        let active: Vec<_> = both.iter().filter(|s| s.is_active()).collect();
+        assert_eq!(active.len(), 1, "one active, one pending");
+        assert_eq!(active[0].comment, "everything");
+        assert_eq!(active[0].created_by, "record-silences.sh");
+        assert_eq!(active[0].matchers_text(), r#"alertname=~".+""#);
+        assert_eq!(active[0].id.len(), 36);
+
+        let pending = both.iter().find(|s| !s.is_active()).unwrap();
+        assert_eq!(
+            pending.matchers_text(),
+            r#"alertname="UnitFehlgeschlagen", instance!="server""#
+        );
+
+        // An expired silence stays in the list; it must not count.
+        let after: Vec<GettableSilence> =
+            serde_json::from_str(&fixture("silences-after-expire.json")).unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(after.iter().all(|s| !s.is_active()));
     }
 
     #[test]

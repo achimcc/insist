@@ -52,6 +52,11 @@ pub struct Texts {
     pub acknowledged: String,
     /// `{alertname}` and `{minutes}` are replaced.
     pub unacknowledged: String,
+    /// Title of the notice about an Alertmanager silence; `{matchers}` is
+    /// replaced.
+    pub silenced: String,
+    /// Its message; `{until}`, `{by}` and `{comment}` are replaced.
+    pub silence_detail: String,
 }
 
 impl Default for Texts {
@@ -62,6 +67,8 @@ impl Default for Texts {
             acknowledge: "Acknowledge".into(),
             acknowledged: "Acknowledged".into(),
             unacknowledged: "{alertname} unacknowledged for {minutes} min".into(),
+            silenced: "Alerts silenced: {matchers}".into(),
+            silence_detail: "until {until} · {by}: {comment}".into(),
         }
     }
 }

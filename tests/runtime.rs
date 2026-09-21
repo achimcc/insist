@@ -46,6 +46,17 @@ impl World {
             .mount(&ntfy)
             .await;
         let am = MockServer::start().await;
+        // No silence unless a test says otherwise. Low priority, so a mock a
+        // test mounts on the same path wins.
+        Mock::given(method("GET"))
+            .and(path("/api/v2/silences"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(recorded("alertmanager-0.31.1/silences-empty.json")),
+            )
+            .with_priority(10)
+            .mount(&am)
+            .await;
         let dog = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ping/x"))
@@ -797,4 +808,90 @@ async fn the_reading_endpoints_stay_open() {
             .await;
         assert_eq!(code, StatusCode::OK, "{path} must not need a token");
     }
+}
+
+async fn empty_alerts(w: &World) {
+    Mock::given(method("GET"))
+        .and(path("/api/v2/alerts"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(recorded("alertmanager-0.31.1/api-empty.json")),
+        )
+        .mount(&w.am)
+        .await;
+}
+
+async fn silences(w: &World, code: u16, fixture: Option<&str>) {
+    let mut answer = ResponseTemplate::new(code);
+    if let Some(f) = fixture {
+        answer = answer.set_body_string(recorded(f));
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v2/silences"))
+        .respond_with(answer)
+        .with_priority(1)
+        .mount(&w.am)
+        .await;
+}
+
+/// Audit finding B15: a silence switches alerts off inside Alertmanager, so
+/// the notice about it must not depend on Alertmanager's routing.
+#[tokio::test]
+async fn an_active_silence_reaches_ntfy_directly_and_only_once() {
+    let w = World::new(200).await;
+    empty_alerts(&w).await;
+    silences(
+        &w,
+        200,
+        Some("alertmanager-0.31.1/silences-active-and-pending.json"),
+    )
+    .await;
+
+    assert!(w.runtime.lock().await.reconcile_once().await);
+    assert!(w.runtime.lock().await.reconcile_once().await);
+
+    let sent = w.ntfy.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1, "one silence, one notice, across two passes");
+    let body = String::from_utf8(sent[0].body.clone()).unwrap();
+    assert!(body.contains(r#"alertname=~\".+\""#), "{body}");
+    assert!(body.contains("\"priority\":5"), "{body}");
+    assert!(body.contains("everything"), "{body}");
+    assert_eq!(metric(&scrape(&w).await, "insist_silences_active"), "1");
+}
+
+#[tokio::test]
+async fn a_failed_silence_read_is_not_an_all_clear_and_starves_the_dead_mans_switch() {
+    let w = World::new(200).await;
+    empty_alerts(&w).await;
+    silences(&w, 500, None).await;
+
+    assert!(!w.runtime.lock().await.reconcile_once().await);
+    let (code, _) = w
+        .call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(w.dog.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        metric(&scrape(&w).await, "insist_silence_poll_failures_total"),
+        "1"
+    );
+}
+
+#[tokio::test]
+async fn a_silence_is_told_even_when_the_alerts_cannot_be_read() {
+    let w = World::new(200).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/alerts"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&w.am)
+        .await;
+    silences(
+        &w,
+        200,
+        Some("alertmanager-0.31.1/silences-active-and-pending.json"),
+    )
+    .await;
+
+    assert!(!w.runtime.lock().await.reconcile_once().await);
+    assert_eq!(w.ntfy.received_requests().await.unwrap().len(), 1);
 }

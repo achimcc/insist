@@ -29,6 +29,8 @@ pub enum Kind {
     Acknowledged,
     Resolved,
     Once,
+    /// The notice about an Alertmanager silence, by silence id.
+    Silence(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -314,6 +316,11 @@ impl Engine {
         });
 
         let mut effects = Effects::default();
+        for (sid, notice) in &self.state.silences {
+            if !notice.announced {
+                effects.publish.push(self.silence_notice(sid, notice));
+            }
+        }
         for (id, instance) in &self.state.instances {
             if instance.resolved_at.is_some() {
                 effects.publish.push(self.resolved(id, instance));
@@ -384,6 +391,70 @@ impl Engine {
         }
     }
 
+    /// Records what `GET /api/v2/silences` answered (B15 of the homeserver
+    /// audit, 2026-09-15). A silence on `alertname=~".+"` switches every
+    /// alert off, and a rule inside Alertmanager that watched for silences
+    /// could be silenced the same way — so the notice goes from here
+    /// straight to ntfy, past Alertmanager's routing.
+    ///
+    /// Only `active` counts: expired silences stay in the list, pending
+    /// ones mute nothing yet. A silence is told once. What was told and is
+    /// no longer active is forgotten; what was NOT told yet stays until it
+    /// is, even if the silence has ended meanwhile — it still happened.
+    pub fn on_silences(&mut self, silences: &[crate::alertmanager::GettableSilence]) {
+        let active: BTreeSet<&str> = silences
+            .iter()
+            .filter(|s| s.is_active())
+            .map(|s| s.id.as_str())
+            .collect();
+        for s in silences.iter().filter(|s| s.is_active()) {
+            let notice = self.state.silences.entry(s.id.clone()).or_insert_with(|| {
+                crate::state::SilenceNotice {
+                    matchers: s.matchers_text(),
+                    ends_at: s.ends_at,
+                    created_by: s.created_by.clone(),
+                    comment: s.comment.clone(),
+                    announced: false,
+                    active: true,
+                }
+            });
+            notice.ends_at = s.ends_at;
+        }
+        for (id, notice) in self.state.silences.iter_mut() {
+            notice.active = active.contains(id.as_str());
+        }
+        self.state.silences.retain(|_, n| n.active || !n.announced);
+    }
+
+    fn silence_notice(&self, sid: &str, n: &crate::state::SilenceNotice) -> Outgoing {
+        let until = n
+            .ends_at
+            .to_zoned(self.tz.clone())
+            .strftime("%Y-%m-%d %H:%M")
+            .to_string();
+        Outgoing {
+            id: None,
+            kind: Kind::Silence(sid.to_string()),
+            probe: false,
+            title: self
+                .config
+                .texts
+                .silenced
+                .replace("{matchers}", &n.matchers),
+            message: self
+                .config
+                .texts
+                .silence_detail
+                .replace("{until}", &until)
+                .replace("{by}", &n.created_by)
+                .replace("{comment}", &n.comment),
+            // It will not escalate: this one notice is all there is.
+            priority: 5,
+            tags: vec!["mute".into()],
+            button: None,
+        }
+    }
+
     fn acknowledged(&self, id: &InstanceId, i: &Instance, at: Timestamp) -> Outgoing {
         Outgoing {
             id: Some(id.clone()),
@@ -416,6 +487,19 @@ impl Engine {
     }
 
     pub fn confirm(&mut self, out: &Outgoing, now: Timestamp) {
+        if let Kind::Silence(sid) = &out.kind {
+            let ended = match self.state.silences.get_mut(sid) {
+                Some(n) => {
+                    n.announced = true;
+                    !n.active
+                }
+                None => false,
+            };
+            if ended {
+                self.state.silences.remove(sid);
+            }
+            return;
+        }
         let Some(id) = &out.id else { return };
         match out.kind {
             Kind::Resolved => {
@@ -433,7 +517,7 @@ impl Engine {
                     i.last_quiet = quiet;
                 }
             }
-            Kind::Once => {}
+            Kind::Once | Kind::Silence(_) => {}
         }
     }
 
@@ -505,6 +589,72 @@ mod tests {
         for r in &fx.raise {
             e.confirm_raise(&r.id);
         }
+    }
+
+    fn recorded_silences(name: &str) -> Vec<crate::alertmanager::GettableSilence> {
+        serde_json::from_str(&recorded(name)).unwrap()
+    }
+    fn silence_notices(fx: &Effects) -> Vec<&Outgoing> {
+        fx.publish
+            .iter()
+            .filter(|o| matches!(o.kind, Kind::Silence(_)))
+            .collect()
+    }
+
+    #[test]
+    fn an_active_silence_is_announced_once_loudly_and_a_pending_one_not_at_all() {
+        let mut e = engine();
+        let list = recorded_silences("silences-active-and-pending.json");
+        let now = plus(list.iter().find(|s| s.is_active()).unwrap().starts_at, 5);
+
+        e.on_silences(&list);
+        let fx = e.tick(now);
+        let notices = silence_notices(&fx);
+        assert_eq!(notices.len(), 1, "the pending silence mutes nothing yet");
+        let n = notices[0];
+        assert!(n.title.contains(r#"alertname=~".+""#), "{}", n.title);
+        assert!(n.message.contains("everything"), "{}", n.message);
+        assert!(n.message.contains("record-silences.sh"), "{}", n.message);
+        assert!(n.priority >= 4, "a muted alert path is not a quiet event");
+        assert!(!n.probe);
+        assert!(n.button.is_none(), "there is nothing to acknowledge");
+        send_all(&mut e, &fx, now);
+
+        e.on_silences(&list);
+        assert!(
+            silence_notices(&e.tick(plus(now, 60))).is_empty(),
+            "announced once per silence, not on every pass"
+        );
+    }
+
+    #[test]
+    fn an_undelivered_silence_notice_stays_due_even_after_the_silence_ended() {
+        let mut e = engine();
+        let active = recorded_silences("silences-active-and-pending.json");
+        let now = plus(active.iter().find(|s| s.is_active()).unwrap().starts_at, 5);
+        e.on_silences(&active);
+        assert_eq!(silence_notices(&e.tick(now)).len(), 1);
+        // ntfy did not take it: nothing confirmed. Meanwhile the silence
+        // was expired again — it still happened, and still gets told.
+        e.on_silences(&recorded_silences("silences-after-expire.json"));
+        let fx = e.tick(plus(now, 15));
+        assert_eq!(silence_notices(&fx).len(), 1);
+        send_all(&mut e, &fx, plus(now, 15));
+        assert!(silence_notices(&e.tick(plus(now, 30))).is_empty());
+        assert!(e.state().silences.is_empty(), "nothing left to remember");
+    }
+
+    #[test]
+    fn a_delivered_silence_that_ended_is_forgotten() {
+        let mut e = engine();
+        let active = recorded_silences("silences-active-and-pending.json");
+        let now = plus(active.iter().find(|s| s.is_active()).unwrap().starts_at, 5);
+        e.on_silences(&active);
+        let fx = e.tick(now);
+        send_all(&mut e, &fx, now);
+        assert_eq!(e.state().silences.len(), 1, "remembered while active");
+        e.on_silences(&recorded_silences("silences-after-expire.json"));
+        assert!(e.state().silences.is_empty());
     }
 
     #[test]

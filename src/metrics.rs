@@ -34,6 +34,12 @@ pub struct Metrics {
     /// included. ntfy sends a keepalive every 45 s by default; a value
     /// older than a few intervals means acknowledgements are not being read.
     pub ack_stream_last_event: Option<Timestamp>,
+    /// Answers of `GET /api/v2/silences` that were not a 200 with a list.
+    /// Such a pass does not count as a successful reconciliation, so the
+    /// dead man's switch starves as well; this says why.
+    pub silence_poll_failures_total: u64,
+    /// Silences Alertmanager listed as active in the last good answer.
+    pub silences_active: u64,
     pub last_reconcile_success: Option<Timestamp>,
     pub last_publish_success: Option<Timestamp>,
     pub open_instances: u64,
@@ -91,6 +97,18 @@ impl Metrics {
             self.future_starts_total.to_string(),
         );
         line(
+            "insist_silence_poll_failures_total",
+            "counter",
+            "Reads of Alertmanager's silences that did not answer 200 with a list.",
+            self.silence_poll_failures_total.to_string(),
+        );
+        line(
+            "insist_silences_active",
+            "gauge",
+            "Silences Alertmanager listed as active in the last good answer.",
+            self.silences_active.to_string(),
+        );
+        line(
             "insist_open_instances",
             "gauge",
             "Instances neither acknowledged nor resolved.",
@@ -106,7 +124,7 @@ impl Metrics {
         line(
             "insist_last_reconcile_success_timestamp_seconds",
             "gauge",
-            "Last successful read of Alertmanager's alerts.",
+            "Last successful read of Alertmanager's alerts and silences.",
             seconds(self.last_reconcile_success),
         );
         line(

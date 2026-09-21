@@ -177,6 +177,29 @@ Every acceptance, together with the stream position it was read at, is
 written to the state file in the same atomic write as everything else, so
 a restart resumes reading exactly where it left off.
 
+## Silences
+
+A silence on `alertname=~".+"` switches every alert off inside Alertmanager.
+Whoever has taken over a machine that can reach Alertmanager's API wants
+exactly that first, and any alerting rule written against silences could be
+silenced the same way. So insist reads `GET /api/v2/silences` on every
+reconciliation and sends one notice per silence that is `active` — straight
+to ntfy, at priority 5, with its matchers, its end, who set it and why.
+There is no button and no ladder: the silence is a fact to be told, not a
+state to be pushed on.
+
+Expired silences stay in Alertmanager's list and pending ones mute nothing
+yet; only `active` counts. A notice is sent once per silence id. It is
+remembered on disk until it has been delivered **and** the silence is no
+longer active — so a silence set and lifted between two passes of a
+hanging ntfy is still told, and the state file does not grow with every
+silence ever set. A restart does not repeat a notice already delivered; an
+unreadable state file does, which is the loud direction.
+
+Reading the silences is part of reconciliation: a pass counts as successful,
+and feeds the dead man's switch, only if both the alerts and the silences
+answered with a 200 and a list. The alerts are processed either way.
+
 ## Failure behaviour
 
 Every failure inside insist is designed to be either louder or visible
@@ -201,6 +224,8 @@ outside.
 | The state file is unreadable | It is moved aside with a timestamp in its name, a counter records that this happened, and insist starts again with an empty state. Every alert that is actually still firing announces itself again on the next reconciliation. |
 | insist restarts | Its state lives on disk, so a restart is not a fresh start: the first reconciliation after coming back up re-establishes every instance that is still firing, and the acknowledgement stream resumes from its saved cursor rather than replaying or skipping. |
 | A webhook body cannot be parsed | Unknown fields are ignored; a body that cannot be read at all answers with a server error, so the alerting system's own retry delivers it again. |
+| Alertmanager's silence list cannot be read | Never read as "nothing is muted". The pass does not count as a successful reconciliation, so the dead man's switch starves and raises the alarm from outside; `insist_silence_poll_failures_total` says why. Alerts are still processed. |
+| A silence notice cannot be delivered | It stays due and is retried on every tick, even after the silence itself has ended. |
 | A silence ends while the alert underneath is still firing | The same instance simply continues escalating according to its own age — a silence ending is not a new event to it. |
 | An alert's `startsAt` lies in the future | Escalation is not switched off: every age is measured from the earlier of `startsAt` and the moment insist first saw the instance (see below). The first sighting more than a minute ahead logs one line and counts in `insist_future_starts_total`. |
 

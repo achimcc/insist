@@ -1,0 +1,46 @@
+[
+  {
+    "id": "39b9e045-0b5d-4616-9fa0-95fe75c8389a",
+    "status": {
+      "state": "active"
+    },
+    "updatedAt": "2026-09-21T16:51:37.823Z",
+    "comment": "everything",
+    "createdBy": "record-silences.sh",
+    "endsAt": "2026-09-21T18:51:37.000Z",
+    "matchers": [
+      {
+        "isEqual": true,
+        "isRegex": true,
+        "name": "alertname",
+        "value": ".+"
+      }
+    ],
+    "startsAt": "2026-09-21T16:51:37.823Z"
+  },
+  {
+    "id": "3f0ecbf3-586b-46f1-aec6-536b8f7fca6f",
+    "status": {
+      "state": "pending"
+    },
+    "updatedAt": "2026-09-21T16:51:37.831Z",
+    "comment": "later",
+    "createdBy": "record-silences.sh",
+    "endsAt": "2026-09-21T18:51:37.000Z",
+    "matchers": [
+      {
+        "isEqual": true,
+        "isRegex": false,
+        "name": "alertname",
+        "value": "UnitFehlgeschlagen"
+      },
+      {
+        "isEqual": false,
+        "isRegex": false,
+        "name": "instance",
+        "value": "server"
+      }
+    ],
+    "startsAt": "2026-09-21T17:21:37.000Z"
+  }
+]

@@ -230,18 +230,40 @@ impl Runtime {
         self.process(effects).await
     }
 
+    /// Reads the silences, then the alerts. A pass counts as successful —
+    /// and keeps the dead man's switch fed — only if BOTH answered: a
+    /// silence list that cannot be read is never "nothing is muted". The
+    /// alerts are still processed when only the silences failed, so
+    /// escalation never waits on the other endpoint.
     pub async fn reconcile_once(&mut self) -> bool {
+        let silences_read = match self.alertmanager.silences().await {
+            Ok(silences) => {
+                self.engine.on_silences(&silences);
+                let active = silences.iter().filter(|s| s.is_active()).count() as u64;
+                self.metrics.lock().unwrap().silences_active = active;
+                true
+            }
+            Err(e) => {
+                tracing::error!("reading Alertmanager's silences failed: {e}");
+                self.metrics.lock().unwrap().silence_poll_failures_total += 1;
+                false
+            }
+        };
         let fetched_at = self.now();
         match self.alertmanager.alerts().await {
             Ok(alerts) => {
                 let now = self.now();
                 let effects = self.engine.on_reconcile(&alerts, fetched_at, now);
-                self.metrics.lock().unwrap().last_reconcile_success = Some(now);
+                if silences_read {
+                    self.metrics.lock().unwrap().last_reconcile_success = Some(now);
+                }
                 self.process(effects).await;
-                true
+                silences_read
             }
             Err(e) => {
                 tracing::error!("reconciliation failed, keeping the last known state: {e}");
+                // Silence notices recorded above still go out.
+                self.tick_once().await;
                 false
             }
         }

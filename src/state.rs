@@ -57,9 +57,27 @@ impl Instance {
     }
 }
 
+/// An Alertmanager silence insist has seen active, and whether the notice
+/// about it went out. Kept only until it is both announced and no longer
+/// active, so the file does not grow with every silence ever set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SilenceNotice {
+    pub matchers: String,
+    pub ends_at: Timestamp,
+    pub created_by: String,
+    pub comment: String,
+    pub announced: bool,
+    /// Whether the last answer from Alertmanager still listed it as active.
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub instances: BTreeMap<InstanceId, Instance>,
+    /// By silence id. `#[serde(default)]`: a state file written before
+    /// insist watched silences must still load.
+    #[serde(default)]
+    pub silences: BTreeMap<String, SilenceNotice>,
     /// The id of the last message read from the acknowledgement topic, so a
     /// restart resumes there instead of losing a press made during a deploy.
     pub ack_cursor: Option<String>,
@@ -126,6 +144,13 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_state_file_from_before_silences_still_loads() {
+        let old = r#"{"instances":{},"ack_cursor":null}"#;
+        let s: State = serde_json::from_str(old).unwrap();
+        assert!(s.silences.is_empty());
+    }
+
     use super::*;
 
     fn now() -> Timestamp {
