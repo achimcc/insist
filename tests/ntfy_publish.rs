@@ -58,3 +58,29 @@ async fn a_403_is_an_error_that_names_the_status_only() {
     assert!(matches!(err, PublishError::Status(403)));
     assert!(!err.to_string().contains("alarmtopic"));
 }
+
+/// Audit 3, B121: reqwest follows up to ten redirects by default, and a 307
+/// resends the body — the topic, and in a step every button's token — to
+/// wherever the answer points. No client of insist follows one.
+#[tokio::test]
+async fn a_redirect_is_not_followed_and_the_body_goes_nowhere_else() {
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&elsewhere)
+        .await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(307).insert_header("location", format!("{}/", elsewhere.uri())),
+        )
+        .mount(&server)
+        .await;
+    let client = NtfyClient::new(&server.uri(), Secret::from("tk_alarm".to_string())).unwrap();
+    let err = client.publish(&publication()).await.unwrap_err();
+    assert!(matches!(err, PublishError::Status(307)), "{err}");
+    assert!(
+        elsewhere.received_requests().await.unwrap().is_empty(),
+        "the body followed the redirect"
+    );
+}

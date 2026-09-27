@@ -20,6 +20,24 @@ pub const OWN_LABEL: &str = "insist";
 /// fault worth a log line.
 pub const FUTURE_START_TOLERANCE_SECS: i64 = 60;
 
+/// After this many refusals of one send that were about the send itself (a
+/// 4xx other than 429, or a 500), it goes out as a minimal text instead:
+/// the alert name or the silence id, and a pointer to Alertmanager. Nothing
+/// a producer wrote can then be what keeps it from being delivered.
+pub const MINIMAL_AFTER: u32 = 3;
+
+/// After this many, a silence notice is given up (see `Engine::failed`).
+/// An alert never is.
+pub const GIVE_UP_AFTER: u32 = 6;
+
+/// How long a silence comment may be inside the notice, before the whole
+/// message is cut to `render::MESSAGE_MAX_BYTES`. Short enough that the
+/// fixed part of the text always survives.
+const COMMENT_MAX_BYTES: usize = 1500;
+const MATCHERS_MAX_CHARS: usize = 150;
+const CREATED_BY_MAX_CHARS: usize = 64;
+const ALERTNAME_MINIMAL_MAX_CHARS: usize = 64;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
     /// The step index and whether this send is the night substitute (see
@@ -43,6 +61,55 @@ pub struct Outgoing {
     pub priority: u8,
     pub tags: Vec<String>,
     pub button: Option<String>,
+}
+
+impl Outgoing {
+    /// Every notification leaves the engine through here: control
+    /// characters gone, title and message cut to what ntfy stores as a
+    /// message (audit 3, B78).
+    fn bounded(mut self) -> Outgoing {
+        self.title = render::cut_chars(&render::clean(&self.title), render::TITLE_MAX_CHARS);
+        self.message = render::cut_bytes(&render::clean(&self.message), render::MESSAGE_MAX_BYTES);
+        self
+    }
+
+    /// The key a failed send is counted under: the same notification on
+    /// the next tick has the same key. None for `Once`, which has no next
+    /// tick (Alertmanager retries the webhook instead).
+    fn failure_key(&self) -> Option<String> {
+        let id = self.id.as_ref().map(|i| i.as_str());
+        match (&self.kind, id) {
+            (Kind::Silence(sid), _) => Some(format!("silence:{sid}")),
+            (Kind::Step(..), Some(id)) => Some(format!("{id}:step")),
+            (Kind::Acknowledged, Some(id)) => Some(format!("{id}:acknowledged")),
+            (Kind::Resolved, Some(id)) => Some(format!("{id}:resolved")),
+            _ => None,
+        }
+    }
+}
+
+/// Refusals of one send that were about the send itself, since its last
+/// delivery. Kept in memory only: after a restart a send gets its
+/// `MINIMAL_AFTER` tries again, which costs a minute, not a notification.
+#[derive(Debug, Clone)]
+struct Failures {
+    count: u32,
+    since: Timestamp,
+    /// Whether ntfy answered a 4xx (other than 429) at least once: a
+    /// verdict on the message, where a 500 may also be ntfy being broken.
+    refused: bool,
+}
+
+/// How a send failed, as far as the engine cares. Answers about ntfy
+/// itself (unreachable, 429, 502 to 504) are not reported here at all: they
+/// say nothing about this message, and the pass stops on them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Failure {
+    /// A 4xx other than 429: ntfy will not take this message.
+    Refused,
+    /// A 500 or another 5xx that is not a proxy's: this message, or ntfy
+    /// broken — only a delivery of something else tells which.
+    ServerError,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,6 +159,9 @@ pub struct Engine {
     config: Config,
     tz: TimeZone,
     ack_key: Secret,
+    ack_key_previous: Option<Secret>,
+    failures: std::collections::BTreeMap<String, Failures>,
+    last_delivery: Option<Timestamp>,
 }
 
 impl Engine {
@@ -102,7 +172,23 @@ impl Engine {
             config,
             tz,
             ack_key,
+            ack_key_previous: None,
+            failures: Default::default(),
+            last_delivery: None,
         })
+    }
+
+    /// The HMAC key before the last rotation: buttons signed with it are
+    /// still accepted, so a rotation does not disarm every button on a
+    /// phone until the next ladder step replaces it (audit 3, B123).
+    pub fn with_previous_ack_key(mut self, key: Option<Secret>) -> Engine {
+        self.ack_key_previous = key;
+        self
+    }
+
+    fn failed_often(&self, key: Option<String>, times: u32) -> bool {
+        key.and_then(|k| self.failures.get(&k))
+            .is_some_and(|f| f.count >= times)
     }
 
     pub fn state(&self) -> &State {
@@ -210,16 +296,19 @@ impl Engine {
             let resolved = alert.status == "resolved";
             if self.config.ladder_for(&alert.labels).is_none() {
                 if !resolved {
-                    effects.publish.push(Outgoing {
-                        id: None,
-                        kind: Kind::Once,
-                        probe: self.is_probe(&alert.labels),
-                        title: render::alertname(&alert.labels),
-                        message: render::summary(&alert.labels, &alert.annotations),
-                        priority: 2,
-                        tags: vec!["information_source".into()],
-                        button: None,
-                    });
+                    effects.publish.push(
+                        Outgoing {
+                            id: None,
+                            kind: Kind::Once,
+                            probe: self.is_probe(&alert.labels),
+                            title: render::alertname(&alert.labels),
+                            message: render::summary(&alert.labels, &alert.annotations),
+                            priority: 2,
+                            tags: vec!["information_source".into()],
+                            button: None,
+                        }
+                        .bounded(),
+                    );
                 }
                 continue;
             }
@@ -315,12 +404,18 @@ impl Engine {
             !(i.resolved_at.is_some() && i.last_step.is_none() && i.acknowledged_at.is_none())
         });
 
+        // Counts for sends that no longer exist are dropped with them.
+        let (instances, silences) = (&self.state.instances, &self.state.silences);
+        self.failures
+            .retain(|key, _| match key.strip_prefix("silence:") {
+                Some(sid) => silences.contains_key(sid),
+                None => key
+                    .split_once(':')
+                    .and_then(|(id, _)| InstanceId::parse(id))
+                    .is_some_and(|id| instances.contains_key(&id)),
+            });
+
         let mut effects = Effects::default();
-        for (sid, notice) in &self.state.silences {
-            if !notice.announced {
-                effects.publish.push(self.silence_notice(sid, notice));
-            }
-        }
         for (id, instance) in &self.state.instances {
             if instance.resolved_at.is_some() {
                 effects.publish.push(self.resolved(id, instance));
@@ -358,7 +453,7 @@ impl Engine {
                 &self.config.night,
                 &self.tz,
             ) {
-                effects.publish.push(self.step(id, instance, &due));
+                effects.publish.push(self.step(id, instance, &due, now));
                 if due.raise_unacknowledged && !instance.unacknowledged_raised {
                     effects.raise.push(Unacknowledged {
                         id: id.clone(),
@@ -369,12 +464,33 @@ impl Engine {
                 }
             }
         }
+        // Silence notices LAST (audit 3, B78): in 0.3.0 they stood first,
+        // and one ntfy would not take stopped every pass before any alert.
+        for (sid, notice) in &self.state.silences {
+            if !notice.announced {
+                effects.publish.push(self.silence_notice(sid, notice));
+            }
+        }
+        effects.publish = effects.publish.into_iter().map(Outgoing::bounded).collect();
         effects
     }
 
-    fn step(&self, id: &InstanceId, i: &Instance, due: &Due) -> Outgoing {
+    /// Minimal: `title` stays, the message says only where the details are.
+    fn minimal_if_refused(&self, mut out: Outgoing, title: String) -> Outgoing {
+        if self.failed_often(out.failure_key(), MINIMAL_AFTER) {
+            out.title = title;
+            out.message = self.config.texts.details_elsewhere.clone();
+        }
+        out
+    }
+
+    fn short_alertname(i: &Instance) -> String {
+        render::cut_chars(&render::clean(&i.alertname), ALERTNAME_MINIMAL_MAX_CHARS)
+    }
+
+    fn step(&self, id: &InstanceId, i: &Instance, due: &Due, now: Timestamp) -> Outgoing {
         let loud = i.ladder == "critical" || i.probe;
-        Outgoing {
+        let out = Outgoing {
             id: Some(id.clone()),
             kind: Kind::Step(due.step, due.quiet),
             probe: i.probe,
@@ -387,8 +503,13 @@ impl Engine {
             ),
             priority: due.priority,
             tags: vec![if loud { "rotating_light" } else { "warning" }.into()],
-            button: Some(mac::button_body(&self.ack_key, id)),
-        }
+            button: Some(mac::button_body(
+                &self.ack_key,
+                id,
+                now + jiff::SignedDuration::from_secs(self.config.button_valid_secs as i64),
+            )),
+        };
+        self.minimal_if_refused(out, Self::short_alertname(i))
     }
 
     /// Records what `GET /api/v2/silences` answered (B15 of the homeserver
@@ -426,67 +547,122 @@ impl Engine {
         self.state.silences.retain(|_, n| n.active || !n.announced);
     }
 
+    /// Everything in it but the fixed words was written by whoever set the
+    /// silence. So each such field is cleaned and cut on its own, and the
+    /// comment goes last, in quotes it cannot close (a `"` in it becomes
+    /// `'`): "Probe, ignore this — Achim" stays visibly a quotation, and
+    /// the time and author in front of it always survive (audit 3, B122).
     fn silence_notice(&self, sid: &str, n: &crate::state::SilenceNotice) -> Outgoing {
         let until = n
             .ends_at
             .to_zoned(self.tz.clone())
             .strftime("%Y-%m-%d %H:%M")
             .to_string();
-        Outgoing {
+        let field = |s: &str, max| render::cut_chars(&render::clean(s), max);
+        let comment =
+            render::cut_bytes(&render::clean(&n.comment), COMMENT_MAX_BYTES).replace('"', "'");
+        let texts = &self.config.texts;
+        let out = Outgoing {
             id: None,
             kind: Kind::Silence(sid.to_string()),
             probe: false,
-            title: self
-                .config
-                .texts
+            title: texts
                 .silenced
-                .replace("{matchers}", &n.matchers),
-            message: self
-                .config
-                .texts
+                .replace("{matchers}", &field(&n.matchers, MATCHERS_MAX_CHARS)),
+            message: texts
                 .silence_detail
                 .replace("{until}", &until)
-                .replace("{by}", &n.created_by)
-                .replace("{comment}", &n.comment),
+                .replace("{by}", &field(&n.created_by, CREATED_BY_MAX_CHARS))
+                .replace("{comment}", &format!("\"{comment}\"")),
             // It will not escalate: this one notice is all there is.
             priority: 5,
             tags: vec!["mute".into()],
             button: None,
-        }
+        };
+        // The id is Alertmanager's own uuid, not something a person typed.
+        let minimal = texts.silenced.replace("{matchers}", &render::clean(sid));
+        self.minimal_if_refused(out, minimal)
     }
 
     fn acknowledged(&self, id: &InstanceId, i: &Instance, at: Timestamp) -> Outgoing {
-        Outgoing {
-            id: Some(id.clone()),
-            kind: Kind::Acknowledged,
-            probe: i.probe,
-            title: format!(
+        let title = |name: &str| {
+            format!(
                 "{} {}: {}",
                 self.config.texts.acknowledged,
                 render::clock(at, &self.tz),
-                i.alertname
-            ),
+                name
+            )
+        };
+        let out = Outgoing {
+            id: Some(id.clone()),
+            kind: Kind::Acknowledged,
+            probe: i.probe,
+            title: title(&i.alertname),
             message: i.summary.clone(),
             priority: 2,
             tags: vec!["ballot_box_with_check".into()],
             button: None,
-        }
+        };
+        self.minimal_if_refused(out, title(&Self::short_alertname(i)))
     }
 
     fn resolved(&self, id: &InstanceId, i: &Instance) -> Outgoing {
-        Outgoing {
+        let title = |name: &str| format!("{}: {}", self.config.texts.resolved, name);
+        let out = Outgoing {
             id: Some(id.clone()),
             kind: Kind::Resolved,
             probe: i.probe,
-            title: format!("{}: {}", self.config.texts.resolved, i.alertname),
+            title: title(&i.alertname),
             message: i.summary.clone(),
             priority: 2,
             tags: vec!["white_check_mark".into()],
             button: None,
+        };
+        self.minimal_if_refused(out, title(&Self::short_alertname(i)))
+    }
+
+    /// A send ntfy refused for a reason about the send itself. Counted, so
+    /// that the next ticks offer it as a minimal text (`MINIMAL_AFTER`).
+    ///
+    /// Returns true when the send is given up — only ever a silence notice,
+    /// after `GIVE_UP_AFTER` refusals, and only when those refusals were
+    /// about the message: a 4xx, or 500s while ntfy DID deliver something
+    /// else since the first of them. An ntfy that answers 500 to everything
+    /// is broken, and the notice waits for it. A given-up notice counts as
+    /// told: it no longer holds its place in the state once the silence
+    /// ends (in 0.3.0 it stayed forever, across restarts). An alert is
+    /// never given up; it stays pending and `InsistSendetNicht` sees it.
+    pub fn failed(&mut self, out: &Outgoing, failure: Failure, now: Timestamp) -> bool {
+        let Some(key) = out.failure_key() else {
+            return false;
+        };
+        let f = self.failures.entry(key.clone()).or_insert(Failures {
+            count: 0,
+            since: now,
+            refused: false,
+        });
+        f.count += 1;
+        f.refused |= failure == Failure::Refused;
+        let about_the_message = f.refused || self.last_delivery.is_some_and(|d| d > f.since);
+        let Kind::Silence(sid) = &out.kind else {
+            return false;
+        };
+        if f.count < GIVE_UP_AFTER || !about_the_message {
+            return false;
         }
+        self.failures.remove(&key);
+        if let Some(n) = self.state.silences.get_mut(sid) {
+            n.announced = true;
+        }
+        self.state.silences.retain(|_, n| n.active || !n.announced);
+        true
     }
 
     pub fn confirm(&mut self, out: &Outgoing, now: Timestamp) {
+        self.last_delivery = Some(now);
+        if let Some(key) = out.failure_key() {
+            self.failures.remove(&key);
+        }
         if let Kind::Silence(sid) = &out.kind {
             let ended = match self.state.silences.get_mut(sid) {
                 Some(n) => {
@@ -528,7 +704,7 @@ impl Engine {
     }
 
     pub fn on_ack(&mut self, body: &str, now: Timestamp) -> AckOutcome {
-        let Some(id) = mac::verify(&self.ack_key, body) else {
+        let Some(id) = mac::verify(&self.ack_key, self.ack_key_previous.as_ref(), body, now) else {
             return AckOutcome::Rejected;
         };
         match self.state.instances.get_mut(&id) {
@@ -671,7 +847,7 @@ mod tests {
         assert_eq!(first.title, "UnitFehlgeschlagen");
         let body = first.button.clone().expect("a button");
         assert_eq!(
-            crate::mac::verify(&Secret::from(KEY.to_string()), &body),
+            crate::mac::verify(&Secret::from(KEY.to_string()), None, &body, t0),
             first.id
         );
         send_all(&mut e, &fx, t0);
@@ -724,6 +900,115 @@ mod tests {
         ));
     }
 
+    // --- Audit 3 (2026-09-27): B78, B122, B123 ---
+
+    fn silence_with_comment(comment: &str) -> Vec<crate::alertmanager::GettableSilence> {
+        let mut list = recorded_silences("silences-active-and-pending.json");
+        for s in list.iter_mut().filter(|s| s.is_active()) {
+            s.comment = comment.to_string();
+        }
+        list
+    }
+
+    #[test]
+    fn a_silence_notice_goes_behind_every_alert_in_the_pass() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        e.on_silences(&silence_with_comment("Wartung"));
+        let fx = e.on_webhook(&w, t0);
+        let kinds: Vec<_> = fx.publish.iter().map(|o| o.kind.clone()).collect();
+        assert_eq!(kinds.len(), 2, "{kinds:?}");
+        assert_eq!(kinds[0], Kind::Step(0, false), "{kinds:?}");
+        assert!(matches!(kinds[1], Kind::Silence(_)), "{kinds:?}");
+    }
+
+    #[test]
+    fn every_notification_is_cleaned_and_cut() {
+        let mut e = engine();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&recorded("webhook-firing-single.json")).unwrap();
+        v["alerts"][0]["annotations"]["summary"] =
+            format!("line one\nline two\u{1b}[31m {}", "x".repeat(10_000)).into();
+        v["alerts"][0]["labels"]["alertname"] = "N".repeat(500).into();
+        let w: WebhookMessage = serde_json::from_value(v).unwrap();
+        let fx = e.on_webhook(&w, w.alerts[0].starts_at);
+        let o = &fx.publish[0];
+        assert!(
+            o.message.len() <= render::MESSAGE_MAX_BYTES,
+            "{}",
+            o.message.len()
+        );
+        assert!(o.title.chars().count() <= render::TITLE_MAX_CHARS);
+        assert!(
+            o.message.starts_with("line one line two [31m"),
+            "{}",
+            &o.message[..40]
+        );
+    }
+
+    #[test]
+    fn a_step_ntfy_keeps_refusing_goes_out_minimal_with_its_button_and_is_never_given_up() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        let mut fx = e.on_webhook(&w, t0);
+        for n in 1..=20 {
+            let out = fx.publish[0].clone();
+            assert!(
+                !e.failed(&out, Failure::Refused, plus(t0, n)),
+                "an alert is never given up"
+            );
+            fx = e.tick(plus(t0, n));
+            assert_eq!(fx.publish.len(), 1, "still owed after {n} refusals");
+        }
+        let o = &fx.publish[0];
+        assert_eq!(o.message, "Details in Alertmanager");
+        assert_eq!(o.title, "UnitFehlgeschlagen");
+        assert!(o.button.is_some(), "the minimal text keeps its button");
+        // A delivery clears the count: the next step is written in full.
+        send_all(&mut e, &fx, plus(t0, 20));
+        let fx = e.tick(plus(t0, 900));
+        assert_ne!(fx.publish[0].message, "Details in Alertmanager");
+    }
+
+    #[test]
+    fn a_button_expires_after_button_valid_secs_and_a_new_step_brings_a_new_one() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        let fx = e.on_webhook(&w, t0);
+        let body = fx.publish[0].button.clone().unwrap();
+        send_all(&mut e, &fx, t0);
+        let valid = e.config().button_valid_secs as i64;
+        assert_eq!(e.on_ack(&body, plus(t0, valid + 1)), AckOutcome::Rejected);
+        let fx = e.tick(plus(t0, valid + 1));
+        let fresh = fx.publish[0].button.clone().unwrap();
+        assert!(matches!(
+            e.on_ack(&fresh, plus(t0, valid + 2)),
+            AckOutcome::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn a_button_signed_before_a_key_rotation_still_acknowledges() {
+        let old = Secret::from("old-key-old-key-old-key-old-key-".to_string());
+        let mut e = Engine::new(
+            State::default(),
+            Config::from_toml(MINIMAL).unwrap(),
+            Secret::from(KEY.to_string()),
+        )
+        .unwrap()
+        .with_previous_ack_key(Some(Secret::from(old.expose().to_string())));
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        let fx = e.on_webhook(&w, t0);
+        send_all(&mut e, &fx, t0);
+        let id = fx.publish[0].id.clone().unwrap();
+        let before_rotation = crate::mac::button_body(&old, &id, plus(t0, 3600));
+        assert_eq!(e.on_ack(&before_rotation, t0), AckOutcome::Accepted(id));
+    }
+
     #[test]
     fn a_failed_send_is_retried_on_the_next_tick() {
         let mut e = engine();
@@ -749,6 +1034,7 @@ mod tests {
         let stranger = crate::mac::button_body(
             &Secret::from(KEY.to_string()),
             &InstanceId::parse("fedcba9876543210").unwrap(),
+            plus(t0, 60),
         );
         assert!(matches!(e.on_ack(&stranger, t0), AckOutcome::Unknown(_)));
         assert_eq!(

@@ -105,3 +105,25 @@ async fn posts_alerts_in_the_shape_the_api_expects() {
         "{body}"
     );
 }
+
+/// Audit 3, B121: a redirect is an answer, not a detour. An Alertmanager
+/// that answers 302 did not answer the question, and its target is not
+/// asked instead.
+#[tokio::test]
+async fn a_redirect_is_not_followed() {
+    let elsewhere = answering(200, &recorded("api-active.json")).await;
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/api/v2/alerts", elsewhere.uri())),
+        )
+        .mount(&s)
+        .await;
+    assert!(AlertmanagerClient::new(&s.uri())
+        .unwrap()
+        .alerts()
+        .await
+        .is_err());
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
+}

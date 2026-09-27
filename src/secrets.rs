@@ -22,7 +22,15 @@ pub struct Secrets {
     /// stage 0 forever, and any body at all pings the dead man's switch
     /// (audit B41).
     pub webhook_token: Secret,
+    /// Optional: the HMAC key before the last rotation. Buttons it signed
+    /// keep working until the phone shows newer ones; remove it after the
+    /// longest `button_valid_secs`.
+    pub ack_key_previous: Option<Secret>,
 }
+
+/// Shorter than this, a credential a stranger must not guess is short.
+/// Both are generated, never typed, so 32 bytes cost nothing.
+pub const MIN_SECRET_BYTES: usize = 32;
 
 impl Secrets {
     pub fn read(path: &Path) -> Result<Secrets> {
@@ -56,7 +64,37 @@ impl Secrets {
             ack_key: take("ACK_HMAC_KEY")?,
             watchdog_url: take("WATCHDOG_URL")?,
             webhook_token: take("WEBHOOK_TOKEN")?,
+            ack_key_previous: take("ACK_HMAC_KEY_PREVIOUS").ok(),
         })
+    }
+
+    /// The names — never the values — of the credentials shorter than
+    /// `MIN_SECRET_BYTES` (audit 3, B120): the two that stand between a
+    /// stranger and a forged webhook or a forged button.
+    pub fn short(&self) -> Vec<&'static str> {
+        let mut short = Vec::new();
+        let mut check = |name, s: Option<&Secret>| {
+            if s.is_some_and(|s| s.expose().len() < MIN_SECRET_BYTES) {
+                short.push(name);
+            }
+        };
+        check("WEBHOOK_TOKEN", Some(&self.webhook_token));
+        check("ACK_HMAC_KEY", Some(&self.ack_key));
+        check("ACK_HMAC_KEY_PREVIOUS", self.ack_key_previous.as_ref());
+        short
+    }
+
+    /// What `short_secrets` in the configuration says to do about them:
+    /// an error naming them for `refuse`, the list for `warn`.
+    pub fn check_length(&self, policy: crate::config::ShortSecrets) -> Result<Vec<&'static str>> {
+        let short = self.short();
+        if policy == crate::config::ShortSecrets::Refuse && !short.is_empty() {
+            bail!(
+                "shorter than {MIN_SECRET_BYTES} bytes: {} (short_secrets = \"refuse\")",
+                short.join(", ")
+            );
+        }
+        Ok(short)
     }
 }
 
@@ -85,6 +123,37 @@ mod tests {
     #[test]
     fn an_empty_value_counts_as_missing() {
         assert!(Secrets::parse(&FULL.replace("NTFY_TOPIC=alarme-xyz", "NTFY_TOPIC=")).is_err());
+    }
+
+    const LONG: &str = "NTFY_TOPIC=alarme-xyz\nNTFY_TOKEN=tk_abc\nNTFY_BUTTON_TOKEN=tk_knopf\nACK_HMAC_KEY=00ff00ff00ff00ff00ff00ff00ff00ff\nWATCHDOG_URL=https://hc.example/ping/geheim\nWEBHOOK_TOKEN=tk_hook_tk_hook_tk_hook_tk_hook_\n";
+
+    #[test]
+    fn short_credentials_are_named_and_refused_only_when_asked() {
+        use crate::config::ShortSecrets;
+        let long = Secrets::parse(LONG).unwrap();
+        assert!(long.short().is_empty());
+        assert!(long.check_length(ShortSecrets::Refuse).is_ok());
+
+        let short = Secrets::parse(FULL).unwrap();
+        assert_eq!(short.short(), vec!["WEBHOOK_TOKEN", "ACK_HMAC_KEY"]);
+        assert_eq!(
+            short.check_length(ShortSecrets::Warn).unwrap(),
+            vec!["WEBHOOK_TOKEN", "ACK_HMAC_KEY"]
+        );
+        let err = short
+            .check_length(ShortSecrets::Refuse)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("WEBHOOK_TOKEN") && err.contains("ACK_HMAC_KEY"),
+            "{err}"
+        );
+        assert!(!err.contains("tk_hook") && !err.contains("00ff"), "{err}");
+
+        let with_previous = Secrets::parse(&format!("{LONG}ACK_HMAC_KEY_PREVIOUS=abc\n")).unwrap();
+        assert_eq!(with_previous.short(), vec!["ACK_HMAC_KEY_PREVIOUS"]);
+        assert_eq!(with_previous.ack_key_previous.unwrap().expose(), "abc");
+        assert!(Secrets::parse(LONG).unwrap().ack_key_previous.is_none());
     }
 
     #[test]

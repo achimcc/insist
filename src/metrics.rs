@@ -14,6 +14,12 @@ pub struct Metrics {
     /// Sends that were due in the last pass and failed. The alert
     /// InsistSendetNicht fires on this staying above zero.
     pub publish_pending: u64,
+    /// Silence notices given up after ntfy refused them `GIVE_UP_AFTER`
+    /// times, the minimal text included. Each one is a silence nobody was
+    /// told about by ntfy; the journal names it.
+    pub publish_abandoned_total: u64,
+    /// Credentials shorter than `secrets::MIN_SECRET_BYTES`, counted at start.
+    pub short_secrets: u64,
     pub state_corrupt_total: u64,
     pub state_save_failures_total: u64,
     /// Attempts to raise the "unacknowledged" mail alert in Alertmanager
@@ -71,6 +77,18 @@ impl Metrics {
             "gauge",
             "Notifications due in the last pass that failed.",
             self.publish_pending.to_string(),
+        );
+        line(
+            "insist_publish_abandoned_total",
+            "counter",
+            "Silence notices given up after ntfy refused even their minimal text.",
+            self.publish_abandoned_total.to_string(),
+        );
+        line(
+            "insist_short_secrets",
+            "gauge",
+            "Credentials (WEBHOOK_TOKEN, ACK_HMAC_KEY) shorter than 32 bytes at start.",
+            self.short_secrets.to_string(),
         );
         line(
             "insist_state_corrupt_total",
@@ -164,6 +182,8 @@ mod tests {
             "insist_ack_rejected_total",
             "insist_publish_failures_total",
             "insist_publish_pending",
+            "insist_publish_abandoned_total",
+            "insist_short_secrets",
             "insist_state_corrupt_total",
             "insist_state_save_failures_total",
             "insist_raise_failures_total",

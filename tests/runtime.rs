@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 /// The bearer token every authenticated call in these tests carries.
 const TEST_TOKEN: &str = "tk_test_webhook_token";
@@ -39,10 +39,19 @@ impl World {
     /// `watchdog_url`: where the dead man's switch is expected; `None` is
     /// the `dog` mock, which answers 200.
     async fn with_watchdog_url(ntfy_code: u16, watchdog_url: Option<String>) -> World {
+        World::build(ResponseTemplate::new(ntfy_code), watchdog_url).await
+    }
+
+    /// An ntfy that answers each publication as `answer` decides.
+    async fn with_ntfy<R: Respond + 'static>(answer: R) -> World {
+        World::build(answer, None).await
+    }
+
+    async fn build<R: Respond + 'static>(answer: R, watchdog_url: Option<String>) -> World {
         let ntfy = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
-            .respond_with(ResponseTemplate::new(ntfy_code))
+            .respond_with(answer)
             .mount(&ntfy)
             .await;
         let am = MockServer::start().await;
@@ -181,7 +190,7 @@ async fn a_webhook_becomes_a_notification_with_sequence_id_and_button_and_is_sav
     assert!(action["body"]
         .as_str()
         .unwrap()
-        .starts_with(&format!("a1.{seq}.")));
+        .starts_with(&format!("a2.{seq}.")));
     let saved = std::fs::read_to_string(w.dir.path().join("state.json")).unwrap();
     assert!(saved.contains(seq));
 }
@@ -894,4 +903,260 @@ async fn a_silence_is_told_even_when_the_alerts_cannot_be_read() {
 
     assert!(!w.runtime.lock().await.reconcile_once().await);
     assert_eq!(w.ntfy.received_requests().await.unwrap().len(), 1);
+}
+
+// --- Audit 3 (2026-09-27), finding B78: a long silence comment stopped
+// every notification, for good. ---
+
+/// ntfy 2.26.0 as measured in the audit (with an attachment cache, as
+/// deployed): a message of about 4 to 8 KB is answered 500 (error 50001,
+/// "content length mismatch" while turning it into an attachment), anything
+/// larger 413.
+struct Ntfy2260Limits;
+
+impl Respond for Ntfy2260Limits {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let v: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let len = v["message"].as_str().unwrap_or("").len();
+        ResponseTemplate::new(if len > 8192 {
+            413
+        } else if len >= 4096 {
+            500
+        } else {
+            200
+        })
+    }
+}
+
+/// The recorded silence list, with the ACTIVE silence's comment replaced.
+fn silence_commented(comment: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&recorded(
+        "alertmanager-0.31.1/silences-active-and-pending.json",
+    ))
+    .unwrap();
+    for s in v.as_array_mut().unwrap() {
+        if s["status"]["state"] == "active" {
+            s["comment"] = comment.into();
+        }
+    }
+    v.to_string()
+}
+
+fn active_silence_id() -> String {
+    let v: serde_json::Value = serde_json::from_str(&recorded(
+        "alertmanager-0.31.1/silences-active-and-pending.json",
+    ))
+    .unwrap();
+    v.as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["status"]["state"] == "active")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Replaces whatever Alertmanager answered so far: no alerts, and `silences`
+/// as the silence list.
+async fn am_answers(w: &World, silences: String) {
+    w.am.reset().await;
+    empty_alerts(w).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/silences"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(silences))
+        .mount(&w.am)
+        .await;
+}
+
+fn is_silence_notice(m: &serde_json::Value) -> bool {
+    m["tags"][0] == "mute"
+}
+
+fn message_len(m: &serde_json::Value) -> usize {
+    m["message"].as_str().unwrap().len()
+}
+
+/// The audit's end-to-end reproduction, against a stand-in with ntfy's
+/// measured limits: a silence with a 5 KB comment, then a critical alert.
+/// In 0.3.0 neither ever reached ntfy — the notice was answered 500, the 500
+/// stopped the pass, and the notice stood first in every later pass.
+#[tokio::test]
+async fn a_long_silence_comment_blocks_neither_its_own_notice_nor_the_alerts_behind_it() {
+    let w = World::with_ntfy(Ntfy2260Limits).await;
+    am_answers(&w, silence_commented(&"A".repeat(5000))).await;
+    w.runtime.lock().await.reconcile_once().await;
+    w.post_webhook("alertmanager-0.31.1/webhook-firing-single.json")
+        .await;
+
+    let p = w.published().await;
+    assert!(
+        p.iter()
+            .any(|m| is_silence_notice(m) && message_len(m) < 4096),
+        "the silence notice never went out in a size ntfy accepts"
+    );
+    assert!(
+        p.iter()
+            .any(|m| m.get("actions").is_some() && message_len(m) < 4096),
+        "the alert behind the silence notice never went out"
+    );
+    assert_eq!(metric(&scrape(&w).await, "insist_publish_pending"), "0");
+}
+
+#[tokio::test]
+async fn a_twenty_kilobyte_comment_is_cut_to_fit_and_stays_quoted_at_the_end() {
+    let w = World::new(200).await;
+    let comment = format!("{}\nFORGED LINE \u{1b}[31m\"ok\"", "B".repeat(20_000));
+    am_answers(&w, silence_commented(&comment)).await;
+    w.runtime.lock().await.reconcile_once().await;
+
+    let p = w.published().await;
+    assert_eq!(p.len(), 1);
+    let (title, message) = (
+        p[0]["title"].as_str().unwrap(),
+        p[0]["message"].as_str().unwrap(),
+    );
+    assert!(message.len() <= 3500, "{} bytes", message.len());
+    assert!(title.chars().count() <= 200, "{title}");
+    assert!(message.contains("BBBB"), "{message}");
+    assert!(!message.contains('\n') && !message.contains('\u{1b}'));
+    // A fixed frame: the comment sits last, in quotes it cannot close.
+    assert!(message.ends_with('"'), "{message}");
+    assert_eq!(message.matches('"').count(), 2, "{message}");
+}
+
+#[tokio::test]
+async fn control_characters_in_a_comment_never_reach_ntfy_or_the_journal() {
+    let w = World::new(200).await;
+    am_answers(&w, silence_commented("Probe\nFORGED\r\u{1b}[2J\u{7}end")).await;
+    w.runtime.lock().await.reconcile_once().await;
+    let p = w.published().await;
+    let message = p[0]["message"].as_str().unwrap();
+    assert!(!message.chars().any(|c| c.is_control()), "{message:?}");
+    assert!(message.contains("Probe FORGED"), "{message:?}");
+}
+
+/// A notice ntfy keeps refusing (a 4xx is about the message) goes out three
+/// times as written, three times as a minimal text without anything from
+/// the silence but its id, and is then given up — loudly, on the metrics.
+/// When the silence ends, nothing of it is left in the state.
+#[tokio::test]
+async fn a_notice_ntfy_keeps_refusing_is_shortened_then_given_up_and_forgotten() {
+    let w = World::new(400).await;
+    am_answers(&w, silence_commented("Wartung")).await;
+    for _ in 0..8 {
+        w.runtime.lock().await.reconcile_once().await;
+    }
+
+    let p = w.published().await;
+    assert_eq!(p.len(), 6, "three as written, three minimal, then no more");
+    let id = active_silence_id();
+    assert!(p[2]["message"].as_str().unwrap().contains("Wartung"));
+    for minimal in &p[3..] {
+        assert!(
+            minimal["title"].as_str().unwrap().contains(&id),
+            "{minimal}"
+        );
+        assert!(!minimal.to_string().contains("Wartung"), "{minimal}");
+    }
+    let m = scrape(&w).await;
+    assert_eq!(metric(&m, "insist_publish_abandoned_total"), "1");
+    assert_eq!(metric(&m, "insist_publish_pending"), "0");
+
+    am_answers(&w, recorded("alertmanager-0.31.1/silences-empty.json")).await;
+    w.runtime.lock().await.reconcile_once().await;
+    assert!(w.runtime.lock().await.engine.state().silences.is_empty());
+}
+
+/// But an ntfy that answers 500 to EVERYTHING is broken, not refusing this
+/// one message: the notice is shortened, and kept until ntfy works again.
+#[tokio::test]
+async fn when_ntfy_answers_500_to_everything_the_notice_is_kept() {
+    let w = World::new(500).await;
+    am_answers(&w, silence_commented("Wartung")).await;
+    for _ in 0..10 {
+        w.runtime.lock().await.reconcile_once().await;
+    }
+    assert_eq!(
+        metric(&scrape(&w).await, "insist_publish_abandoned_total"),
+        "0"
+    );
+    assert_eq!(w.runtime.lock().await.engine.state().silences.len(), 1);
+}
+
+/// ntfy answers 500 to one body it cannot store; that says nothing about
+/// the next message, so it must not stop the pass. 502 to 504 come from a
+/// proxy in front of an ntfy that is gone, and still do.
+#[tokio::test]
+async fn a_500_leaves_the_pass_running_and_a_503_still_stops_it() {
+    for (code, expected) in [(500, 5), (503, 1)] {
+        let w = World::new(code).await;
+        w.call(
+            Request::post("/")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&a_storm_of(5)).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            w.ntfy.received_requests().await.unwrap().len(),
+            expected,
+            "HTTP {code}"
+        );
+    }
+}
+
+/// `InsistSendetNicht` travels through Alertmanager and can be silenced
+/// with everything else. The dead man's switch cannot: when notifications
+/// have been failing for longer than `watchdog_withhold_pending_secs`
+/// (900 by default), insist stops forwarding the watchdog ping.
+#[tokio::test]
+async fn notifications_failing_for_fifteen_minutes_withhold_the_watchdog_ping() {
+    let w = World::new(500).await;
+    // A silence notice an ntfy answering 500 to everything never takes, and
+    // insist keeps: pending from the first pass on.
+    am_answers(&w, silence_commented("Wartung")).await;
+    assert!(w.runtime.lock().await.reconcile_once().await);
+    let ping = || async {
+        w.call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+            .await
+            .0
+    };
+    assert_eq!(ping().await, StatusCode::OK);
+    w.advance(600);
+    w.runtime.lock().await.reconcile_once().await;
+    assert_eq!(ping().await, StatusCode::OK);
+    w.advance(301);
+    assert!(w.runtime.lock().await.reconcile_once().await);
+    assert_eq!(ping().await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(w.dog.received_requests().await.unwrap().len(), 2);
+}
+
+/// Audit 3, B121: the watchdog forward does not follow a redirect either —
+/// the URL is a credential, and a 3xx is a refused ping, counted.
+#[tokio::test]
+async fn a_redirecting_dead_mans_switch_is_a_refused_ping() {
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&elsewhere)
+        .await;
+    let switch = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(307).insert_header("location", format!("{}/", elsewhere.uri())),
+        )
+        .mount(&switch)
+        .await;
+    let w = World::with_watchdog_url(200, Some(format!("{}/ping", switch.uri()))).await;
+    good_reconcile(&w).await;
+    let (code, _) = w
+        .call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await;
+    assert_eq!(code, StatusCode::BAD_GATEWAY);
+    assert!(elsewhere.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        metric(&scrape(&w).await, "insist_watchdog_forward_failures_total"),
+        "1"
+    );
 }

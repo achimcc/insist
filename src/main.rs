@@ -24,6 +24,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "/etc/insist.toml".into());
     let config = Config::load(std::path::Path::new(&path))?;
     let secrets = Secrets::read(&config.secrets_file)?;
+    for name in secrets.check_length(config.short_secrets)? {
+        tracing::warn!(
+            "{name} is shorter than {} bytes; generate a longer one",
+            insist::secrets::MIN_SECRET_BYTES
+        );
+    }
     let loaded = State::load(&config.state_file, jiff::Timestamp::now())?;
     let ack_topic = Secret::from(format!(
         "{}{}",

@@ -4,7 +4,7 @@
 //! the freshness check, never the POST itself).
 use crate::alertmanager::{AlertmanagerClient, PostableAlert, WebhookMessage};
 use crate::config::Config;
-use crate::engine::{AckOutcome, Effects, Engine, Kind, Outgoing, OWN_LABEL};
+use crate::engine::{AckOutcome, Effects, Engine, Failure, Kind, Outgoing, OWN_LABEL};
 use crate::metrics::{Metrics, MetricsHandle};
 use crate::ntfy::{Action, NtfyClient, Publication, PublishError, StreamLine};
 use crate::secret::Secret;
@@ -32,6 +32,9 @@ pub struct Runtime {
     pub alertmanager: AlertmanagerClient,
     pub watchdog: reqwest::Client,
     pub clock: Clock,
+    /// Since when every pass has left a notification undelivered; None
+    /// while the last pass delivered everything it had.
+    pending_since: Option<Timestamp>,
 }
 
 fn copy(s: &Secret) -> Secret {
@@ -50,7 +53,9 @@ impl Runtime {
             tracing::error!("state file was unreadable, moved to {}; every firing alert will be announced again", moved.display());
             metrics.state_corrupt_total = 1;
         }
-        let engine = Engine::new(loaded.state, config.clone(), copy(&secrets.ack_key))?;
+        let engine = Engine::new(loaded.state, config.clone(), copy(&secrets.ack_key))?
+            .with_previous_ack_key(secrets.ack_key_previous.as_ref().map(copy));
+        metrics.short_secrets = secrets.short().len() as u64;
         // A restart with open instances already on disk must report them
         // from the first scrape, not only after the next pass touches them.
         metrics.open_instances = engine.open_instances() as u64;
@@ -58,13 +63,17 @@ impl Runtime {
             engine,
             ntfy: NtfyClient::new(&config.ntfy_url, copy(&secrets.token))?,
             alertmanager: AlertmanagerClient::new(&config.alertmanager_url)?,
+            // No redirects (audit 3, B121): the body goes where the URL
+            // says, or nowhere. A 3xx counts as a refused ping.
             watchdog: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             metrics: Arc::new(StdMutex::new(metrics)),
             config,
             secrets,
             clock,
+            pending_since: None,
         })
     }
 
@@ -197,17 +206,37 @@ impl Runtime {
                 Err(e) => {
                     tracing::error!("not delivered: {}: {e}", out.title);
                     self.metrics.lock().unwrap().publish_failures_total += 1;
-                    pending += 1;
                     if out.kind == Kind::Once {
                         failed_once += 1;
                     }
-                    if halts_the_pass(&e) {
-                        halted = true;
+                    match about_the_message(&e) {
+                        None => {
+                            halted = true;
+                            pending += 1;
+                        }
+                        Some(failure) => {
+                            let now = self.now();
+                            if self.engine.failed(out, failure, now) {
+                                tracing::error!(
+                                    "given up after {} refusals, not even the minimal text went through: {}",
+                                    crate::engine::GIVE_UP_AFTER,
+                                    out.title
+                                );
+                                self.metrics.lock().unwrap().publish_abandoned_total += 1;
+                            } else {
+                                pending += 1;
+                            }
+                        }
                     }
                 }
             }
         }
         let open_instances = self.engine.open_instances() as u64;
+        if pending == 0 {
+            self.pending_since = None;
+        } else if self.pending_since.is_none() {
+            self.pending_since = Some(self.now());
+        }
         {
             let mut m = self.metrics.lock().unwrap();
             m.publish_pending = pending;
@@ -316,6 +345,18 @@ impl Runtime {
             );
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
+        // Audit 3, B78: `InsistSendetNicht` fires on the same condition, but
+        // through Alertmanager, where one silence mutes it with everything
+        // else. The dead man's switch sits outside and cannot be silenced.
+        let limit = self.config.watchdog_withhold_pending_secs;
+        if let Some(since) = self.pending_since {
+            if limit > 0 && now.as_second() - since.as_second() > limit as i64 {
+                tracing::error!(
+                    "watchdog ping withheld: notifications have been failing for more than {limit} s"
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
         Ok(WatchdogTarget {
             client: self.watchdog.clone(),
             url: copy(&self.secrets.watchdog_url),
@@ -326,6 +367,8 @@ impl Runtime {
 }
 
 /// Does this failure say something about **ntfy**, or about this one message?
+/// None: about ntfy — the pass stops. Some: about the message — the pass
+/// goes on, and the engine counts it against that one send.
 ///
 /// An answer about ntfy will be the same answer for every remaining send in
 /// the pass, so asking again is at best pointless and at worst the thing that
@@ -343,10 +386,18 @@ impl Runtime {
 ///   **128100 requests in 100 seconds** — measured on 2026-09-14, against an
 ///   ntfy that was already rate-limiting. The amplification arrives exactly
 ///   when it hurts most.
-/// * **5xx** — ntfy is broken, not this message.
+/// * **502, 503, 504** — the proxy in front of ntfy (Caddy, here) saying
+///   ntfy is gone or slow.
 ///
-/// Everything else (a 400, a 413, a 401) is about the one notification and
-/// leaves the pass running.
+/// Everything else (a 400, a 413, a 401 — and **a 500**) is about the one
+/// notification and leaves the pass running. Until 0.4.0 every 5xx halted.
+/// Audit 3 (B78, 2026-09-27) measured what that did: ntfy 2.26.0 answers a
+/// 4 to 8 KB message with 500 (error 50001 while turning it into an
+/// attachment), a silence notice with a long comment stood first in every
+/// pass, and from then on NOT ONE alert reached ntfy — past the end of the
+/// silence and across restarts. A 4xx is `Refused`, a 500 `ServerError`: the
+/// engine tells a broken ntfy from a message it will not take by whether
+/// anything else got through meanwhile.
 ///
 /// ## What B42 also proposed, and why it is deliberately not here
 ///
@@ -365,10 +416,12 @@ impl Runtime {
 /// wait is precisely that. If a per-visitor budget ever turns out to need
 /// more, the number to change is `tick_secs`, which is configuration and
 /// does not touch the escalation ladder at all.
-fn halts_the_pass(e: &PublishError) -> bool {
+fn about_the_message(e: &PublishError) -> Option<Failure> {
     match e {
-        PublishError::Transport => true,
-        PublishError::Status(code) => *code == 429 || (500..600).contains(code),
+        PublishError::Transport => None,
+        PublishError::Status(429 | 502..=504) => None,
+        PublishError::Status(code) if (400..500).contains(code) => Some(Failure::Refused),
+        PublishError::Status(_) => Some(Failure::ServerError),
     }
 }
 

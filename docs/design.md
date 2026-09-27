@@ -151,8 +151,8 @@ previous notification on the phone rather than stacking a new one beside
 it — the push service does this by matching on the instance id, which
 doubles as that service's own identifier for the message. Pressing the
 button posts a short signed body to a topic of its own —
-`a1.<instance-id>.<mac>` — where `<mac>` authenticates the instance id
-against a key only insist holds, compared in constant time so that timing
+`a2.<instance-id>.<expiry>.<mac>` — where `<mac>` authenticates the
+instance id and the expiry against a key only insist holds, compared in constant time so that timing
 cannot leak anything about a correct value. The button's own token is
 meant to be granted write access to that one topic only — never
 permission to read alerts, or to post to the alert topic itself — though
@@ -160,6 +160,18 @@ enforcing that division is the operator's job, via the push service's own
 access control, not insist's. A button token that leaks therefore cannot
 forge an alert with a working button, and can only ever acknowledge the
 one specific instance named in a body it captured — nothing more.
+
+Since 0.4.0 (audit 3, B123) a button also expires, `button_valid_secs`
+after it was sent (seven days by default). Every ladder step replaces the
+notification with a fresh button, so the limit only has to outlast the
+longest gap between two sends of one instance; the configuration is refused
+unless it exceeds that gap by a day, the longest a night can push a step.
+The earlier format `a1.<instance-id>.<mac>`, without expiry, is still
+accepted, so buttons already on a phone keep working across the upgrade; an
+`a1` body cannot be derived from an `a2` one, since the two MACs are over
+different texts. A key rotation no longer disarms every visible button:
+`ACK_HMAC_KEY_PREVIOUS`, while set, verifies as well. No key id travels in
+the body — trying both keys costs one more HMAC.
 
 insist reads that topic as a stream, resuming after any disconnect or
 restart from the id of the last line it read rather than from the
@@ -196,6 +208,32 @@ hanging ntfy is still told, and the state file does not grow with every
 silence ever set. A restart does not repeat a notice already delivered; an
 unreadable state file does, which is the loud direction.
 
+Everything in a notice except its fixed words was typed by whoever set the
+silence: the matchers, `createdBy`, the comment. Each is cleaned (control
+characters and direction marks become spaces — every title is also a
+journal line) and cut on its own, and the comment goes last, in quotes it
+cannot close (a `"` in it becomes `'`), so "probe, ignore this" stays
+visibly a quotation and the time and author in front of it always survive.
+`texts.silence_detail` must therefore end with `{comment}`.
+
+Audit 3 (B78, 2026-09-27) is why this matters beyond looks. 0.3.0 passed the
+comment on uncut; ntfy 2.26.0 answers a 4 to 8 KB message with a 500
+(error 50001, while turning it into an attachment), larger ones with 413;
+a 500 stopped the pass; and silence notices stood first in every pass. One
+silence with a 5 KB comment — on any alert, even one that does not exist —
+therefore stopped every notification insist sent, for good: the undelivered
+notice outlived the silence and a restart. Since 0.4.0 every notification is
+cut below ntfy's limit (title 200 characters, message 3500 bytes), silence
+notices go after every alert in a pass, a 500 no longer stops a pass, and a
+send ntfy keeps refusing turns into a minimal text after three tries (the
+alert name or the silence id, and "Details in Alertmanager" — nothing a
+producer wrote). A silence notice refused three more times is given up,
+logged and counted in `insist_publish_abandoned_total`, and leaves the
+state once the silence ends — but only when the refusals were about the
+message: a 4xx, or 500s while ntfy delivered something else meanwhile. An
+ntfy that answers 500 to everything is broken, and the notice waits for it.
+An alert is never given up.
+
 Reading the silences is part of reconciliation: a pass counts as successful,
 and feeds the dead man's switch, only if both the alerts and the silences
 answered with a 200 and a list. The alerts are processed either way.
@@ -225,7 +263,8 @@ outside.
 | insist restarts | Its state lives on disk, so a restart is not a fresh start: the first reconciliation after coming back up re-establishes every instance that is still firing, and the acknowledgement stream resumes from its saved cursor rather than replaying or skipping. |
 | A webhook body cannot be parsed | Unknown fields are ignored; a body that cannot be read at all answers with a server error, so the alerting system's own retry delivers it again. |
 | Alertmanager's silence list cannot be read | Never read as "nothing is muted". The pass does not count as a successful reconciliation, so the dead man's switch starves and raises the alarm from outside; `insist_silence_poll_failures_total` says why. Alerts are still processed. |
-| A silence notice cannot be delivered | It stays due and is retried on every tick, even after the silence itself has ended. |
+| A silence notice cannot be delivered | It stays due and is retried on every tick, even after the silence itself has ended — after three refusals about the message as a minimal text, after six given up and counted in `insist_publish_abandoned_total` (see "Silences"). It is sent after every alert of the pass, so it never holds one up. |
+| Notifications keep failing for 15 minutes | `/watchdog` answers 503 instead of forwarding the ping (`watchdog_withhold_pending_secs`), so the external dead man's switch raises the alarm. The alert on `insist_publish_pending` says the same, but through Alertmanager — where a silence mutes it along with everything else. |
 | A silence ends while the alert underneath is still firing | The same instance simply continues escalating according to its own age — a silence ending is not a new event to it. |
 | An alert's `startsAt` lies in the future | Escalation is not switched off: every age is measured from the earlier of `startsAt` and the moment insist first saw the instance (see below). The first sighting more than a minute ahead logs one line and counts in `insist_future_starts_total`. |
 
@@ -238,7 +277,8 @@ insist's own watchdog to kill it — turning a service that is only waiting
 on a slow network call into one that gets restarted for it.
 
 Since 0.2.4 that bound covers a refusal that is about the service as well:
-**429 and 5xx**, not only an unreachable one. The reason is a measurement,
+**429 and 502 to 504** (until 0.4.0: every 5xx), not only an unreachable
+one. The reason is a measurement,
 not a tidiness argument. Every webhook ends with a tick, a tick offers every
 open instance that is due, and a failed send leaves `last_sent` alone — so
 before 0.2.4 each webhook in a storm retried every alert that had arrived
@@ -248,8 +288,11 @@ when the service was already saying it had had enough. With the bound, a
 refusing service costs one request per tick, whatever the number of open
 instances.
 
-A refusal that is about **one message** (a 400, a 413, a 401) deliberately
-does not halt the pass. One malformed notification must not hold up every
+A refusal that is about **one message** (a 400, a 413, a 401 — and, since
+0.4.0, a 500) deliberately does not halt the pass. ntfy answers 500 to a
+body it cannot store; halting on it let one silence comment stop every
+notification (audit 3, B78). 502 to 504 are a proxy's answers about an ntfy
+that is gone, and still halt. One malformed notification must not hold up every
 other alert in the house — that would be the amplification's mirror image,
 a single bad message silencing everything.
 

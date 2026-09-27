@@ -29,6 +29,41 @@ pub struct Config {
     pub ladders: std::collections::BTreeMap<String, crate::ladder::Ladder>,
     #[serde(default)]
     pub texts: Texts,
+    /// While notifications have been failing (`insist_publish_pending` > 0)
+    /// for longer than this, the watchdog ping is no longer forwarded, so
+    /// the external dead man's switch raises the alarm. `InsistSendetNicht`
+    /// says the same through Alertmanager — and a silence mutes it along
+    /// with everything else (audit 3, B78). 0 turns this off. Default 900,
+    /// the `for:` of that rule.
+    #[serde(default = "default_withhold")]
+    pub watchdog_withhold_pending_secs: u64,
+    /// How long an Acknowledge button stays valid after it was sent. Every
+    /// ladder step sends a fresh one, so this only has to outlast the
+    /// longest gap between two sends of one instance; `validate` demands
+    /// that gap plus a day (for the night). Default seven days.
+    #[serde(default = "default_button_valid")]
+    pub button_valid_secs: u64,
+    /// What a credential shorter than 32 bytes (`WEBHOOK_TOKEN`,
+    /// `ACK_HMAC_KEY`) does at start: `warn` (the default) logs it and
+    /// shows it as `insist_short_secrets`, `refuse` stops insist.
+    #[serde(default)]
+    pub short_secrets: ShortSecrets,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShortSecrets {
+    #[default]
+    Warn,
+    Refuse,
+}
+
+fn default_withhold() -> u64 {
+    900
+}
+
+fn default_button_valid() -> u64 {
+    7 * 86400
 }
 
 /// Alerts carrying `label = value` go to `<topic><topic_suffix>` instead of
@@ -55,8 +90,14 @@ pub struct Texts {
     /// Title of the notice about an Alertmanager silence; `{matchers}` is
     /// replaced.
     pub silenced: String,
-    /// Its message; `{until}`, `{by}` and `{comment}` are replaced.
+    /// Its message; `{until}`, `{by}` and `{comment}` are replaced. It
+    /// must END with `{comment}`: the comment is the one part written by
+    /// whoever set the silence, and it goes last, in quotes, so it cannot
+    /// pose as the rest of the notice.
     pub silence_detail: String,
+    /// The message of a notification sent as a minimal text, after ntfy
+    /// refused the full one a few times.
+    pub details_elsewhere: String,
 }
 
 impl Default for Texts {
@@ -69,8 +110,39 @@ impl Default for Texts {
             unacknowledged: "{alertname} unacknowledged for {minutes} min".into(),
             silenced: "Alerts silenced: {matchers}".into(),
             silence_detail: "until {until} · {by}: {comment}".into(),
+            details_elsewhere: "Details in Alertmanager".into(),
         }
     }
+}
+
+/// `https://`, or `http://` only to an address no name lookup can move
+/// (audit 3, B121): loopback, `localhost`, or a private or unique-local IP
+/// literal. Through a NAME, whoever answers DNS for it would get the
+/// token, the topic and every button in clear text.
+fn check_url(field: &str, raw: &str) -> Result<()> {
+    use anyhow::bail;
+    use std::net::IpAddr;
+    let url = reqwest::Url::parse(raw).with_context(|| format!("{field} is not a URL"))?;
+    match url.scheme() {
+        "https" => return Ok(()),
+        "http" => {}
+        other => bail!("{field}: scheme {other} is neither https nor http"),
+    }
+    // host_str keeps an IPv6 literal in brackets.
+    let host = url.host_str().unwrap_or("");
+    let fixed = match host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    {
+        Ok(IpAddr::V4(a)) => a.is_loopback() || a.is_private(),
+        Ok(IpAddr::V6(a)) => a.is_loopback() || a.is_unique_local(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    };
+    if !fixed {
+        bail!("{field} must be https:// (plain http only to loopback or a private IP address)");
+    }
+    Ok(())
 }
 
 impl Config {
@@ -130,6 +202,28 @@ impl Config {
         if self.reconcile_secs == 0 || self.tick_secs == 0 {
             bail!("reconcile_secs and tick_secs must be positive");
         }
+        if !self.texts.silence_detail.ends_with("{comment}") {
+            bail!("texts.silence_detail must end with {{comment}}");
+        }
+        let longest_gap = self
+            .ladders
+            .values()
+            .flat_map(|l| {
+                let steps = l
+                    .steps
+                    .windows(2)
+                    .map(|p| p[1].after_secs - p[0].after_secs);
+                steps.chain(l.steps.iter().filter_map(|s| s.repeat_secs))
+            })
+            .max()
+            .unwrap_or(0);
+        if self.button_valid_secs < longest_gap + 86400 {
+            bail!(
+                "button_valid_secs must be at least the longest gap between two sends ({longest_gap} s) plus a day"
+            );
+        }
+        check_url("ntfy_url", &self.ntfy_url)?;
+        check_url("alertmanager_url", &self.alertmanager_url)?;
         Ok(())
     }
 
@@ -261,6 +355,79 @@ pub(crate) mod tests {
             let err = Config::from_toml(&bad).unwrap_err().to_string();
             assert!(err.contains(name), "{err}");
         }
+    }
+
+    #[test]
+    fn plain_http_only_to_an_address_no_lookup_can_move() {
+        let with = |field: &str, url: &str| {
+            let line = MINIMAL
+                .lines()
+                .find(|l| l.starts_with(&format!("{field} =")))
+                .unwrap();
+            Config::from_toml(&MINIMAL.replace(line, &format!("{field} = \"{url}\"")))
+        };
+        for field in ["ntfy_url", "alertmanager_url"] {
+            for ok in [
+                "https://ntfy.example",
+                "http://127.0.0.1:2586",
+                "http://localhost:9093",
+                "http://10.0.20.12:9093",
+                "http://192.168.178.184",
+                "http://[::1]:9093",
+                "http://[fd00:20::12]:9093",
+            ] {
+                assert!(with(field, ok).is_ok(), "{field} = {ok}");
+            }
+            for bad in [
+                "http://ntfy.example",
+                "http://8.8.8.8",
+                "http://[2001:db8::1]",
+                "ftp://10.0.0.1",
+                "ntfy.example",
+            ] {
+                let err = with(field, bad).unwrap_err();
+                assert!(
+                    format!("{err:#}").contains(field),
+                    "{field} = {bad}: {err:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_silence_comment_must_come_last() {
+        let bad = format!("{MINIMAL}\n[texts]\nsilence_detail = \"{{comment}} until {{until}}\"\n");
+        assert!(Config::from_toml(&bad).is_err());
+        let ok = format!(
+            "{MINIMAL}\n[texts]\nsilence_detail = \"bis {{until}} · {{by}}: {{comment}}\"\n"
+        );
+        assert!(Config::from_toml(&ok).is_ok());
+    }
+
+    #[test]
+    fn new_settings_default_and_the_button_outlives_the_longest_gap() {
+        let c = Config::from_toml(MINIMAL).unwrap();
+        assert_eq!(c.watchdog_withhold_pending_secs, 900);
+        assert_eq!(c.button_valid_secs, 7 * 86400);
+        assert_eq!(c.short_secrets, super::ShortSecrets::Warn);
+        // The warning ladder repeats every 43200 s: a day more is the floor.
+        let edge = |secs: u64| {
+            let raw = MINIMAL.replace(
+                "watchdog_max_age_secs = 300",
+                &format!("watchdog_max_age_secs = 300\nbutton_valid_secs = {secs}"),
+            );
+            Config::from_toml(&raw)
+        };
+        assert!(edge(43200 + 86400).is_ok());
+        assert!(edge(43200 + 86399).is_err());
+        let refuse = MINIMAL.replace(
+            "watchdog_max_age_secs = 300",
+            "watchdog_max_age_secs = 300\nshort_secrets = \"refuse\"",
+        );
+        assert_eq!(
+            Config::from_toml(&refuse).unwrap().short_secrets,
+            super::ShortSecrets::Refuse
+        );
     }
 
     #[test]

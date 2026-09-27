@@ -68,11 +68,30 @@ steps = [                                         # each entry: how long after t
 ]                                                  # end of the probe ladder's steps
 ```
 
+Four more settings are optional; these are their defaults:
+
+```toml
+watchdog_withhold_pending_secs = 900   # notifications failing longer than this: /watchdog answers 503, the external dead man's switch alarms (0 = off)
+button_valid_secs = 604800             # an Acknowledge button expires this long after it was sent; must exceed the longest gap between two sends plus a day
+short_secrets = "warn"                 # WEBHOOK_TOKEN / ACK_HMAC_KEY under 32 bytes: "warn" (log + insist_short_secrets) or "refuse" (no start)
+
+[texts]
+details_elsewhere = "Details in Alertmanager"   # message of a notification sent as a minimal text after ntfy refused the full one
+```
+
+`ntfy_url` and `alertmanager_url` must be `https://`, or plain `http://` to
+an address no name lookup can move: loopback, `localhost`, or a private
+(RFC 1918) or unique-local IPv6 literal. No client insist has follows a
+redirect.
+
+`texts.silence_detail` must end with `{comment}`: the comment is written by
+whoever set the silence, and it goes last, in quotes it cannot close.
+
 ## Credential file
 
 The file named by `secrets_file` holds `KEY=VALUE` lines and nothing else.
 It must never live in the Nix store (a world-readable path) — it is handed
-in outside of Nix, for instance via systemd's `LoadCredential`. Five keys
+in outside of Nix, for instance via systemd's `LoadCredential`. Six keys
 are required:
 
 - `NTFY_TOPIC` — the alarm topic. Its name is itself a secret: anyone who
@@ -85,6 +104,16 @@ are required:
 - `ACK_HMAC_KEY` — the key that signs and verifies acknowledgement bodies.
 - `WATCHDOG_URL` — the URL of the external dead man's switch. Its URL is
   itself the credential that authorises pinging it.
+- `WEBHOOK_TOKEN` — the bearer token `POST /` and `POST /watchdog` demand.
+
+One is optional:
+
+- `ACK_HMAC_KEY_PREVIOUS` — the HMAC key before a rotation. Buttons it
+  signed keep acknowledging until the phone shows newer ones; remove it once
+  `button_valid_secs` has passed since the rotation.
+
+`WEBHOOK_TOKEN` and `ACK_HMAC_KEY` should be at least 32 bytes, generated,
+never typed (see `short_secrets` above).
 
 ## NixOS
 

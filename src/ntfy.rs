@@ -79,11 +79,15 @@ pub struct NtfyClient {
 impl NtfyClient {
     pub fn new(base: &str, token: Secret) -> anyhow::Result<NtfyClient> {
         Ok(NtfyClient {
+            // No redirects (audit 3, B121): a 307 would carry the body — the
+            // topic, the button's token — to wherever the answer points.
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             stream_http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             base: base.trim_end_matches('/').to_string(),
             token,
