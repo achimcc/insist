@@ -37,7 +37,7 @@ impl World {
     }
 
     /// `watchdog_url`: where the dead man's switch is expected; `None` is
-    /// the `dog` mock, which answers 200.
+    /// the `dog` mock, which answers 200, and `Some("")` configures none.
     async fn with_watchdog_url(ntfy_code: u16, watchdog_url: Option<String>) -> World {
         World::build(ResponseTemplate::new(ntfy_code), watchdog_url).await
     }
@@ -240,6 +240,31 @@ async fn after_a_good_reconcile_the_watchdog_ping_is_forwarded_until_it_goes_sta
         .call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
         .await;
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// 0.5.0: without `WATCHDOG_URL` the dead man's switch is pinged from
+/// elsewhere. `/watchdog` then forwards nothing, answers 404 even after a good
+/// reconcile, and counts no forward failure -- that would alert on a
+/// deliberate configuration.
+#[tokio::test]
+async fn without_a_watchdog_url_the_endpoint_answers_404_and_forwards_nothing() {
+    let w = World::with_watchdog_url(200, Some(String::new())).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/alerts"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(recorded("alertmanager-0.31.1/api-empty.json")),
+        )
+        .mount(&w.am)
+        .await;
+    assert!(w.runtime.lock().await.reconcile_once().await);
+    let (code, _) = w
+        .call(Request::post("/watchdog").body(Body::from("{}")).unwrap())
+        .await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert_eq!(w.dog.received_requests().await.unwrap().len(), 0);
+    let m = w.metrics.lock().unwrap().render();
+    assert_eq!(metric(&m, "insist_watchdog_forward_failures_total"), "0");
 }
 
 #[tokio::test]

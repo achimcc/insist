@@ -16,7 +16,12 @@ pub struct Secrets {
     pub button_token: Secret,
     pub ack_key: Secret,
     /// The external dead man's switch. Its URL is its credential.
-    pub watchdog_url: Secret,
+    ///
+    /// Optional since 0.5.0: a deployment can ping the dead man's switch from
+    /// a machine the alert path runs on top of, so that whoever takes over the
+    /// machine insist runs on does not hold the one URL that reports it
+    /// silent. Without it `POST /watchdog` answers 404 and forwards nothing.
+    pub watchdog_url: Option<Secret>,
     /// The bearer token `POST /` and `POST /watchdog` demand. Without it a
     /// forged `resolved` deletes an instance and holds the escalation at
     /// stage 0 forever, and any body at all pings the dead man's switch
@@ -51,6 +56,10 @@ impl Secrets {
                 values.insert(k.trim().to_string(), v.trim().to_string());
             }
         }
+        let watchdog_url = values
+            .remove("WATCHDOG_URL")
+            .filter(|v| !v.is_empty())
+            .map(Secret::from);
         let mut take = |key: &str| -> Result<Secret> {
             match values.remove(key) {
                 Some(v) if !v.is_empty() => Ok(Secret::from(v)),
@@ -62,7 +71,7 @@ impl Secrets {
             token: take("NTFY_TOKEN")?,
             button_token: take("NTFY_BUTTON_TOKEN")?,
             ack_key: take("ACK_HMAC_KEY")?,
-            watchdog_url: take("WATCHDOG_URL")?,
+            watchdog_url,
             webhook_token: take("WEBHOOK_TOKEN")?,
             ack_key_previous: take("ACK_HMAC_KEY_PREVIOUS").ok(),
         })
@@ -161,7 +170,10 @@ mod tests {
         let s = Secrets::parse(FULL).unwrap();
         assert_eq!(s.button_token.expose(), "tk_knopf");
         assert_eq!(s.ack_key.expose(), "00ff");
-        assert_eq!(s.watchdog_url.expose(), "https://hc.example/ping/geheim");
+        assert_eq!(
+            s.watchdog_url.as_ref().unwrap().expose(),
+            "https://hc.example/ping/geheim"
+        );
         assert_eq!(s.webhook_token.expose(), "tk_hook");
     }
 
@@ -172,7 +184,6 @@ mod tests {
             "NTFY_TOKEN",
             "NTFY_BUTTON_TOKEN",
             "ACK_HMAC_KEY",
-            "WATCHDOG_URL",
             "WEBHOOK_TOKEN",
         ] {
             let without: String = FULL
@@ -184,5 +195,19 @@ mod tests {
             assert!(err.contains(key), "{err}");
             assert!(!err.contains("geheim") && !err.contains("tk_"), "{err}");
         }
+    }
+
+    /// Since 0.5.0 the dead man's switch may be pinged from elsewhere: a file
+    /// without `WATCHDOG_URL`, or with an empty one, is complete.
+    #[test]
+    fn the_watchdog_url_is_optional_and_empty_means_absent() {
+        let without: String = FULL
+            .lines()
+            .filter(|l| !l.starts_with("WATCHDOG_URL="))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(Secrets::parse(&without).unwrap().watchdog_url.is_none());
+        let empty = FULL.replace("WATCHDOG_URL=https://hc.example/ping/geheim", "WATCHDOG_URL=");
+        assert!(Secrets::parse(&empty).unwrap().watchdog_url.is_none());
     }
 }

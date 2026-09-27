@@ -333,6 +333,12 @@ impl Runtime {
     /// watchdog URL, and the metrics and clock to record the outcome with.
     /// Never logs the URL — it is a credential.
     pub fn watchdog_target(&self) -> Result<WatchdogTarget, StatusCode> {
+        // No URL configured: this deployment pings the dead man's switch
+        // elsewhere. 404, not 503 -- nothing here is unhealthy, the endpoint
+        // simply has nowhere to forward to.
+        let Some(url) = self.secrets.watchdog_url.as_ref() else {
+            return Err(StatusCode::NOT_FOUND);
+        };
         let now = self.now();
         let last = self.metrics.lock().unwrap().last_reconcile_success;
         let fresh = last.is_some_and(|t| {
@@ -359,7 +365,7 @@ impl Runtime {
         }
         Ok(WatchdogTarget {
             client: self.watchdog.clone(),
-            url: copy(&self.secrets.watchdog_url),
+            url: copy(url),
             metrics: self.metrics.clone(),
             clock: self.clock.clone(),
         })

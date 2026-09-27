@@ -102,12 +102,15 @@ are required:
   nothing else — enforcing that is the installer's job, via ntfy's own
   access control, not insist's.
 - `ACK_HMAC_KEY` — the key that signs and verifies acknowledgement bodies.
-- `WATCHDOG_URL` — the URL of the external dead man's switch. Its URL is
-  itself the credential that authorises pinging it.
 - `WEBHOOK_TOKEN` — the bearer token `POST /` and `POST /watchdog` demand.
 
-One is optional:
+Two are optional:
 
+- `WATCHDOG_URL` — the URL of the external dead man's switch. Its URL is
+  itself the credential that authorises pinging it. Without it (since
+  0.5.0) `POST /watchdog` answers 404 and forwards nothing: the switch is
+  then pinged from another machine, so that whoever takes over the one insist
+  runs on does not also hold the URL that would report it silent.
 - `ACK_HMAC_KEY_PREVIOUS` — the HMAC key before a rotation. Buttons it
   signed keep acknowledging until the phone shows newer ones; remove it once
   `button_valid_secs` has passed since the rotation.
