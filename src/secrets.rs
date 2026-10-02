@@ -207,7 +207,10 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect();
         assert!(Secrets::parse(&without).unwrap().watchdog_url.is_none());
-        let empty = FULL.replace("WATCHDOG_URL=https://hc.example/ping/geheim", "WATCHDOG_URL=");
+        let empty = FULL.replace(
+            "WATCHDOG_URL=https://hc.example/ping/geheim",
+            "WATCHDOG_URL=",
+        );
         assert!(Secrets::parse(&empty).unwrap().watchdog_url.is_none());
     }
 }
