@@ -66,6 +66,16 @@
           HOME=$TMPDIR cargo-audit audit --no-fetch --db ${advisory-db} --file ${./Cargo.lock}
           touch $out
         '';
+        # Bans, sources and licenses of the dependency tree (deny.toml).
+        # Inside the package's build environment: the vendored crates are
+        # what `cargo metadata` reads there, so nothing is fetched.
+        deny = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
+          pname = "insist-deny";
+          nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.cargo-deny ];
+          buildPhase = "cargo deny --offline check bans sources licenses";
+          doCheck = false;
+          installPhase = "touch $out";
+        });
         vm = import ./nix/test.nix {
           inherit pkgs;
           module = self.nixosModules.default;

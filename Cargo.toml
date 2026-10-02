@@ -28,3 +28,7 @@ tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
 wiremock = "0.6.5"
+
+[lints.rust]
+# No `unsafe` anywhere in this crate, and no `#[allow]` can bring it back.
+unsafe_code = "forbid"
