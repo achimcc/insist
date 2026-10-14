@@ -350,10 +350,14 @@ async fn after_an_hour_unacknowledged_the_mail_alert_is_raised_in_alertmanager()
     assert_eq!(labels["alertname"], "AlarmUnquittiert");
     assert_eq!(labels["insist"], "unacknowledged");
     assert_eq!(labels["severity"], "critical");
-    assert!(raised[0][0]["annotations"]["summary"]
-        .as_str()
-        .unwrap()
-        .contains("UnitFehlgeschlagen"));
+    assert!(
+        labels.get("undelivered").is_none(),
+        "it was delivered: {labels}"
+    );
+    assert_eq!(
+        raised[0][0]["annotations"]["summary"],
+        "UnitFehlgeschlagen unacknowledged for 60 min"
+    );
 }
 
 #[tokio::test]
@@ -457,6 +461,62 @@ async fn a_raise_still_reaches_alertmanager_even_when_every_send_to_ntfy_is_refu
         "the unacknowledged mail must reach Alertmanager even though every publish to ntfy failed"
     );
     assert_eq!(raised[0][0]["labels"]["alertname"], "AlarmUnquittiert");
+}
+
+async fn posted_alerts(am: &MockServer) -> Vec<serde_json::Value> {
+    am.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+/// 2026-10-14: ntfy behind its proxy was gone for two hours (here: 502,
+/// which halts every pass like an unreachable ntfy). After
+/// `raise_undelivered_after_secs` the alert reaches Alertmanager, once, and
+/// says it was not delivered.
+#[tokio::test]
+async fn an_alert_ntfy_never_takes_reaches_alertmanager_after_fifteen_minutes() {
+    let w = World::new(502).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/alerts"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&w.am)
+        .await;
+    w.post_webhook("alertmanager-0.31.1/webhook-firing-single.json")
+        .await;
+    w.advance(885);
+    w.runtime.lock().await.tick_once().await;
+    assert!(
+        posted_alerts(&w.am).await.is_empty(),
+        "not before 15 minutes"
+    );
+    w.advance(15);
+    w.runtime.lock().await.tick_once().await;
+    for _ in 0..8 {
+        w.advance(900);
+        w.runtime.lock().await.tick_once().await;
+    }
+    let raised = posted_alerts(&w.am).await;
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    let alert = &raised[0][0];
+    assert_eq!(alert["labels"]["alertname"], "AlarmUnquittiert");
+    assert_eq!(alert["labels"]["insist"], "unacknowledged");
+    assert_eq!(alert["labels"]["undelivered"], "true");
+    assert_eq!(
+        alert["annotations"]["summary"],
+        "UnitFehlgeschlagen not delivered, open for 15 min"
+    );
+    assert_eq!(
+        alert["annotations"]["description"],
+        "Unit lan6-set.service auf server ist rot"
+    );
+    assert!(
+        !w.ntfy.received_requests().await.unwrap().is_empty(),
+        "ntfy was asked all along"
+    );
 }
 
 #[tokio::test]

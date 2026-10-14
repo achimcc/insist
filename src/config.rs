@@ -48,6 +48,16 @@ pub struct Config {
     /// shows it as `insist_short_secrets`, `refuse` stops insist.
     #[serde(default)]
     pub short_secrets: ShortSecrets,
+    /// An open instance that ntfy has not taken a single notification for
+    /// since insist first saw it this long ago is raised as the
+    /// "unacknowledged" alert at once, without waiting for the ladder's
+    /// `raise_unacknowledged` step: nobody can acknowledge what never
+    /// arrived, and mail is then the only way it reaches anyone (the ntfy
+    /// outage of 2026-10-14 held every alert back for two hours). Only for
+    /// ladders that raise at all, and like every raise not at night on a
+    /// `quiet_at_night` ladder. 0 turns this off. Default 900.
+    #[serde(default = "default_raise_undelivered")]
+    pub raise_undelivered_after_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
@@ -59,6 +69,10 @@ pub enum ShortSecrets {
 }
 
 fn default_withhold() -> u64 {
+    900
+}
+
+fn default_raise_undelivered() -> u64 {
     900
 }
 
@@ -87,6 +101,11 @@ pub struct Texts {
     pub acknowledged: String,
     /// `{alertname}` and `{minutes}` are replaced.
     pub unacknowledged: String,
+    /// The same alert when ntfy never took a notification for the instance
+    /// (see `raise_undelivered_after_secs`): it must not claim nobody
+    /// acknowledged what nobody received. `{alertname}` and `{minutes}` (its
+    /// age, as above) are replaced.
+    pub undelivered: String,
     /// Title of the notice about an Alertmanager silence; `{matchers}` is
     /// replaced.
     pub silenced: String,
@@ -108,6 +127,7 @@ impl Default for Texts {
             acknowledge: "Acknowledge".into(),
             acknowledged: "Acknowledged".into(),
             unacknowledged: "{alertname} unacknowledged for {minutes} min".into(),
+            undelivered: "{alertname} not delivered, open for {minutes} min".into(),
             silenced: "Alerts silenced: {matchers}".into(),
             silence_detail: "until {until} · {by}: {comment}".into(),
             details_elsewhere: "Details in Alertmanager".into(),
@@ -410,6 +430,11 @@ pub(crate) mod tests {
         assert_eq!(c.watchdog_withhold_pending_secs, 900);
         assert_eq!(c.button_valid_secs, 7 * 86400);
         assert_eq!(c.short_secrets, super::ShortSecrets::Warn);
+        assert_eq!(c.raise_undelivered_after_secs, 900);
+        assert_eq!(
+            c.texts.undelivered,
+            "{alertname} not delivered, open for {minutes} min"
+        );
         // The warning ladder repeats every 43200 s: a day more is the floor.
         let edge = |secs: u64| {
             let raw = MINIMAL.replace(

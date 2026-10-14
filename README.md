@@ -34,7 +34,7 @@ ack_topic_suffix = "-quittung"                    # suffix appended to the alarm
 reconcile_secs = 60                               # how often insist asks Alertmanager's API what is actually still firing
 tick_secs = 15                                    # how often insist checks every open instance against its ladder
 watchdog_max_age_secs = 300                       # a reconciliation older than this makes /watchdog answer 503 instead of forwarding the ping
-unacknowledged_alertname = "AlarmUnquittiert"     # alertname insist raises back into Alertmanager once a critical step's raise_unacknowledged fires
+unacknowledged_alertname = "AlarmUnquittiert"     # alertname insist raises back into Alertmanager once a step's raise_unacknowledged fires, or an alert stays undelivered
 # "rec" is the receiver name used when recording fixtures/alertmanager-0.31.1.
 receivers = ["rec"]                               # Alertmanager receivers whose webhook points at insist; every other receiver is ignored on reconciliation
 
@@ -68,16 +68,32 @@ steps = [                                         # each entry: how long after t
 ]                                                  # end of the probe ladder's steps
 ```
 
-Four more settings are optional; these are their defaults:
+Five more settings are optional; these are their defaults:
 
 ```toml
 watchdog_withhold_pending_secs = 900   # notifications failing longer than this: /watchdog answers 503, the external dead man's switch alarms (0 = off)
+raise_undelivered_after_secs = 900     # an instance ntfy has taken nothing for since insist first saw it this long ago is raised as the "unacknowledged" alert at once (0 = off; see below)
 button_valid_secs = 604800             # an Acknowledge button expires this long after it was sent; must exceed the longest gap between two sends plus a day
 short_secrets = "warn"                 # WEBHOOK_TOKEN / ACK_HMAC_KEY under 32 bytes: "warn" (log + insist_short_secrets) or "refuse" (no start)
 
 [texts]
 details_elsewhere = "Details in Alertmanager"   # message of a notification sent as a minimal text after ntfy refused the full one
+undelivered = "{alertname} not delivered, open for {minutes} min"   # summary of the raised alert when ntfy never took a notification for the instance
 ```
+
+**An alert ntfy never takes still reaches mail** (since 0.6.0). The
+`raise_unacknowledged` step comes by the alert's age — an hour, four hours —
+and until then an alert that never reached a phone reached nobody: on
+2026-10-14 ntfy was unreachable for two hours and every alert of that time
+waited for it. An instance for which ntfy has not confirmed a single
+notification is therefore raised as soon as it is
+`raise_undelivered_after_secs` past insist's first sight of it, once, like
+the ladder's own raise: only on a ladder that has a `raise_unacknowledged`
+step, never while suppressed or acknowledged, and on a `quiet_at_night`
+ladder not before the night ends. Such a raise — and the ladder's own, if
+it comes first for an instance never delivered — carries the label
+`undelivered="true"` and `texts.undelivered` as its summary instead of
+`texts.unacknowledged`: nobody failed to acknowledge what nobody received.
 
 `ntfy_url` and `alertmanager_url` must be `https://`, or plain `http://` to
 an address no name lookup can move: loopback, `localhost`, or a private

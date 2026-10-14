@@ -152,13 +152,18 @@ impl Runtime {
             labels.insert("severity".to_string(), "critical".to_string());
             labels.insert(OWN_LABEL.to_string(), "unacknowledged".to_string());
             labels.insert("insist_instance".to_string(), raise.id.as_str().to_string());
+            // Since 0.6.0: the mail about an alert ntfy never took says so,
+            // in the summary and in a label a route or template can match.
+            let text = if raise.undelivered {
+                labels.insert("undelivered".to_string(), "true".to_string());
+                &self.config.texts.undelivered
+            } else {
+                &self.config.texts.unacknowledged
+            };
             let mut annotations = BTreeMap::new();
             annotations.insert(
                 "summary".to_string(),
-                self.config
-                    .texts
-                    .unacknowledged
-                    .replace("{alertname}", &raise.alertname)
+                text.replace("{alertname}", &raise.alertname)
                     .replace("{minutes}", &raise.minutes.to_string()),
             );
             annotations.insert("description".to_string(), raise.summary.clone());

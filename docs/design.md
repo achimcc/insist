@@ -143,6 +143,21 @@ incidental); insist ignores every alert carrying that label key, regardless
 of its value, so it can never end up watching, escalating, or raising an
 alert about itself.
 
+That step comes by the alert's age, and it assumed the push notifications
+before it had arrived. On 2026-10-14 the push service was unreachable for
+two hours: every alert of that time reached nobody until it came back, and
+a `warning` (raise after four hours) never reached mail at all. So since
+0.6.0 an instance the push service has not confirmed a single notification
+for is raised the same way once it is `raise_undelivered_after_secs` (default
+fifteen minutes) past insist's first sight of it. Counted from first sight,
+not from the alert's start, so an alert insist learns of late still gets
+the full wait for the push service first. Everything else about the raise
+holds: once per instance, never while suppressed or acknowledged, only on a
+ladder that raises at all, and on a quiet ladder not during the night. The
+raised alert says what happened — the label `undelivered="true"` and its
+own summary text — because "unacknowledged" would be a claim about a human
+who never saw anything.
+
 ## Acknowledging
 
 Every notification for a `critical`, `warning` or `probe` instance carries
@@ -257,7 +272,7 @@ outside.
 | The alerting system itself is down | The watchdog ping stops (dead man's switch again). Known instances keep escalating — they are never treated as resolved just because reconciliation cannot currently ask. |
 | The dead man's switch refuses the ping or cannot be reached | `/watchdog` answers 502, so the alerting system retries it. Every failed forward counts in `insist_watchdog_forward_failures_total`, and `insist_watchdog_last_success_timestamp_seconds` stops advancing; the switch's URL appears in no log line. If the pings stay away, the switch raises its own alarm from outside. |
 | The alerting API answers with an error | An error from that API is never read as "nothing is firing". Only an HTTP 200 with a valid JSON array of alerts counts as an answer; anything else leaves the last known state untouched, and the dead man's switch ping ages. |
-| The push service is down | Mail keeps working. A step counts as sent only once the push service actually accepts it; otherwise it stays due and is retried on the next tick. If an instance is still unacknowledged after about an hour, its "unacknowledged" alert still reaches mail on its own route regardless. |
+| The push service is down | Mail keeps working. A step counts as sent only once the push service actually accepts it; otherwise it stays due and is retried on the next tick. An instance not one notification of which got through is raised into the alerting system after `raise_undelivered_after_secs` (fifteen minutes), marked `undelivered="true"`, and reaches mail on its own route; one that did get through is raised at its ladder's step as before. The raise goes to the alerting system's API, never through the push service, and before any publish of the pass. |
 | The acknowledgement stream breaks | insist reconnects with backoff, resuming from its last saved cursor. A press that cannot be read yet simply has not been read yet: the instance keeps escalating exactly as if nobody had pressed anything. Every line the push service sends on the stream, its periodic keepalives included, moves `insist_ack_stream_last_event_timestamp_seconds`; a stream that is gone without an error shows as that gauge no longer advancing. |
 | The state file is unreadable | It is moved aside with a timestamp in its name, a counter records that this happened, and insist starts again with an empty state. Every alert that is actually still firing announces itself again on the next reconciliation. |
 | insist restarts | Its state lives on disk, so a restart is not a fresh start: the first reconciliation after coming back up re-establishes every instance that is still firing, and the acknowledgement stream resumes from its saved cursor rather than replaying or skipping. |

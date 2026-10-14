@@ -117,7 +117,11 @@ pub struct Unacknowledged {
     pub id: InstanceId,
     pub alertname: String,
     pub summary: String,
+    /// The instance's age, from `Instance::effective_start`.
     pub minutes: i64,
+    /// ntfy has not taken a single notification for this instance: the
+    /// raise must not say "unacknowledged" about something nobody received.
+    pub undelivered: bool,
 }
 
 /// An instance recorded for the first time whose `startsAt` lies more than
@@ -445,23 +449,34 @@ impl Engine {
                 last_sent: instance.last_sent,
                 quiet: instance.last_quiet,
             };
-            if let Some(due) = ladder::due(
+            let due = ladder::due(
                 ladder,
                 instance.effective_start(),
                 &progress,
                 now,
                 &self.config.night,
                 &self.tz,
-            ) {
-                effects.publish.push(self.step(id, instance, &due, now));
-                if due.raise_unacknowledged && !instance.unacknowledged_raised {
-                    effects.raise.push(Unacknowledged {
-                        id: id.clone(),
-                        alertname: instance.alertname.clone(),
-                        summary: instance.summary.clone(),
-                        minutes: (now.as_second() - instance.effective_start().as_second()) / 60,
-                    });
-                }
+            );
+            if let Some(due) = &due {
+                effects.publish.push(self.step(id, instance, due, now));
+            }
+            // Two ways to the mail. The ladder's own step, by the instance's
+            // age — and, since 0.6.0, an instance ntfy never took anything
+            // for, by how long insist has been trying (2026-10-14: ntfy was
+            // unreachable for two hours, and every alert of that time
+            // reached nobody until it came back).
+            let undelivered = instance.last_step.is_none();
+            let by_ladder = due.as_ref().is_some_and(|d| d.raise_unacknowledged);
+            let raise =
+                by_ladder || (undelivered && self.undelivered_too_long(instance, ladder, now));
+            if raise && !instance.unacknowledged_raised {
+                effects.raise.push(Unacknowledged {
+                    id: id.clone(),
+                    alertname: instance.alertname.clone(),
+                    summary: instance.summary.clone(),
+                    minutes: (now.as_second() - instance.effective_start().as_second()) / 60,
+                    undelivered,
+                });
             }
         }
         // Silence notices LAST (audit 3, B78): in 0.3.0 they stood first,
@@ -473,6 +488,21 @@ impl Engine {
         }
         effects.publish = effects.publish.into_iter().map(Outgoing::bounded).collect();
         effects
+    }
+
+    /// Whether an instance ntfy has taken nothing for is owed the mail now
+    /// (`raise_undelivered_after_secs`). Counted from `first_seen`, not from
+    /// its start: an alert insist learns of late (after a restart, say) gets
+    /// the full wait for ntfy first, and the raise — which goes out before
+    /// any publish in a pass — never beats the very first attempt. Not for
+    /// a ladder that never raises, and not at night on a quiet one: there
+    /// the ladder's own raise waits for the morning too.
+    fn undelivered_too_long(&self, i: &Instance, l: &ladder::Ladder, now: Timestamp) -> bool {
+        let limit = self.config.raise_undelivered_after_secs;
+        limit > 0
+            && l.raises()
+            && !l.quiet_now(now, &self.config.night, &self.tz)
+            && now.as_second() - i.first_seen.as_second() >= limit as i64
     }
 
     /// Minimal: `title` stays, the message says only where the details are.
@@ -1394,6 +1424,207 @@ mod tests {
             e.tick(plus(t0, 7500)).publish.is_empty(),
             "07:05 local: the loud repeat was just sent, nothing new due"
         );
+    }
+
+    // --- 2026-10-14: ntfy unreachable for two hours, nothing raised ---
+
+    /// The constructed config, with the warning ladder raising at 4 h as
+    /// the homeserver's does.
+    fn engine_with(extra: &str) -> Engine {
+        let raw = MINIMAL
+            .replace(
+                "{ after_secs = 14400, repeat_secs = 43200, priority = 4 }",
+                "{ after_secs = 14400, repeat_secs = 43200, priority = 4, raise_unacknowledged = true }",
+            )
+            .replace(
+                "watchdog_max_age_secs = 300",
+                &format!("watchdog_max_age_secs = 300\n{extra}"),
+            );
+        Engine::new(
+            State::default(),
+            Config::from_toml(&raw).unwrap(),
+            Secret::from(KEY.to_string()),
+        )
+        .unwrap()
+    }
+
+    fn with_severity(severity: &str, starts_at: Option<&str>) -> WebhookMessage {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&recorded("webhook-firing-single.json")).unwrap();
+        v["alerts"][0]["labels"]["severity"] = severity.into();
+        if let Some(s) = starts_at {
+            v["alerts"][0]["startsAt"] = s.into();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Ticks every 15 s from `from` to `to` inclusive with ntfy taking
+    /// nothing; returns every raise and when it came.
+    fn ticks_undelivered(
+        e: &mut Engine,
+        from: Timestamp,
+        to: Timestamp,
+    ) -> Vec<(Timestamp, Unacknowledged)> {
+        let mut raised = vec![];
+        let mut now = from;
+        while now <= to {
+            let fx = e.tick(now);
+            for r in fx.raise {
+                e.confirm_raise(&r.id);
+                raised.push((now, r));
+            }
+            now = plus(now, 15);
+        }
+        raised
+    }
+
+    #[test]
+    fn an_alert_ntfy_never_takes_is_raised_once_after_the_wait() {
+        let mut e = engine();
+        let w = single(); // critical: the ladder's own raise is at 60 min
+        let t0 = w.alerts[0].starts_at;
+        let fx = e.on_webhook(&w, t0);
+        assert!(
+            fx.raise.is_empty(),
+            "the first attempt comes before any mail"
+        );
+
+        let raised = ticks_undelivered(&mut e, plus(t0, 15), plus(t0, 7200));
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        let (at, r) = &raised[0];
+        assert_eq!(*at, plus(t0, 900), "after raise_undelivered_after_secs");
+        assert!(r.undelivered);
+        assert_eq!(r.minutes, 15);
+        assert_eq!(r.alertname, "UnitFehlgeschlagen");
+        assert_eq!(r.summary, "Unit lan6-set.service auf server ist rot");
+    }
+
+    #[test]
+    fn a_delivered_alert_raises_only_at_its_ladder_step_and_says_unacknowledged() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        let fx = e.on_webhook(&w, t0);
+        send_all(&mut e, &fx, t0);
+        let mut now = plus(t0, 15);
+        while now < plus(t0, 3600) {
+            let fx = e.tick(now);
+            assert!(fx.raise.is_empty(), "no raise before the step, at {now}");
+            send_all(&mut e, &fx, now);
+            now = plus(now, 15);
+        }
+        let fx = e.tick(plus(t0, 3600));
+        assert_eq!(fx.raise.len(), 1);
+        assert!(!fx.raise[0].undelivered);
+        assert_eq!(fx.raise[0].minutes, 60);
+    }
+
+    #[test]
+    fn a_warning_ntfy_never_takes_is_raised_long_before_its_four_hours() {
+        let mut e = engine_with("");
+        // 14:00 local (CEST): daytime.
+        let w = with_severity("warning", Some("2026-09-12T12:00:00Z"));
+        let t0 = w.alerts[0].starts_at;
+        e.on_webhook(&w, t0);
+        let raised = ticks_undelivered(&mut e, plus(t0, 15), plus(t0, 7200));
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].0, plus(t0, 900));
+        assert!(raised[0].1.undelivered);
+    }
+
+    #[test]
+    fn at_night_a_quiet_ladder_waits_for_the_morning_even_undelivered() {
+        let mut e = engine_with("");
+        // 05:00 local: the warning ladder is quiet until 07:00.
+        let w = with_severity("warning", Some("2026-09-12T03:00:00Z"));
+        let t0 = w.alerts[0].starts_at;
+        e.on_webhook(&w, t0);
+        let raised = ticks_undelivered(&mut e, plus(t0, 15), plus(t0, 7200));
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert_eq!(raised[0].0, plus(t0, 7200), "07:00 local, not before");
+        assert_eq!(raised[0].1.minutes, 120);
+    }
+
+    #[test]
+    fn a_critical_ladder_ignores_the_night_and_raises_undelivered_at_once() {
+        let mut e = engine_with("");
+        let w = with_severity("critical", Some("2026-09-12T01:00:00Z")); // 03:00 local
+        let t0 = w.alerts[0].starts_at;
+        e.on_webhook(&w, t0);
+        let raised = ticks_undelivered(&mut e, plus(t0, 15), plus(t0, 1800));
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].0, plus(t0, 900));
+    }
+
+    #[test]
+    fn a_ladder_that_never_raises_does_not_start_to_because_ntfy_is_down() {
+        // The constructed warning ladder has no raise_unacknowledged step.
+        let mut e = engine();
+        let w = with_severity("warning", Some("2026-09-12T12:00:00Z"));
+        let t0 = w.alerts[0].starts_at;
+        e.on_webhook(&w, t0);
+        assert!(ticks_undelivered(&mut e, plus(t0, 15), plus(t0, 7200)).is_empty());
+    }
+
+    #[test]
+    fn a_suppressed_instance_is_not_raised_even_undelivered() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        e.on_webhook(&w, t0);
+        let id = InstanceId::of(&w.alerts[0].fingerprint, t0);
+        e.state_mut().instances.get_mut(&id).unwrap().suppressed = true;
+        assert!(ticks_undelivered(&mut e, plus(t0, 15), plus(t0, 7200)).is_empty());
+    }
+
+    #[test]
+    fn an_alert_learned_of_late_gets_the_full_wait_for_ntfy_first() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        // Learned of 50 minutes after it started (insist restarted).
+        let seen = plus(t0, 3000);
+        let fx = e.on_webhook(&w, seen);
+        assert!(fx.raise.is_empty());
+        let raised = ticks_undelivered(&mut e, plus(seen, 15), plus(seen, 3000));
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        // The ladder's own raise (60 min of age) comes first here, 10 min
+        // after insist saw it — and it, too, says "not delivered".
+        assert_eq!(raised[0].0, plus(t0, 3600));
+        assert!(raised[0].1.undelivered);
+        assert_eq!(raised[0].1.minutes, 60);
+    }
+
+    #[test]
+    fn zero_turns_the_undelivered_raise_off() {
+        let mut e = engine_with("raise_undelivered_after_secs = 0");
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        e.on_webhook(&w, t0);
+        let raised = ticks_undelivered(&mut e, plus(t0, 15), plus(t0, 7200));
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].0, plus(t0, 3600), "only the ladder's own step");
+        assert!(raised[0].1.undelivered, "the text still tells the truth");
+    }
+
+    #[test]
+    fn delivered_after_the_undelivered_raise_there_is_no_second_mail() {
+        let mut e = engine();
+        let w = single();
+        let t0 = w.alerts[0].starts_at;
+        e.on_webhook(&w, t0);
+        assert_eq!(
+            ticks_undelivered(&mut e, plus(t0, 15), plus(t0, 900)).len(),
+            1
+        );
+        // ntfy is back: from here on everything is delivered.
+        let mut now = plus(t0, 915);
+        while now <= plus(t0, 7200) {
+            let fx = e.tick(now);
+            assert!(fx.raise.is_empty(), "raised once per instance, at {now}");
+            send_all(&mut e, &fx, now);
+            now = plus(now, 15);
+        }
     }
 
     // Measured live 2026-09-14: Alertmanager 0.31.1 sets startsAt = endsAt

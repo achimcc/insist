@@ -26,6 +26,19 @@ pub struct Ladder {
     pub quiet_at_night: bool,
 }
 
+impl Ladder {
+    /// Whether any step raises the "unacknowledged" alert: a ladder that
+    /// never mails does not start to because ntfy is down.
+    pub fn raises(&self) -> bool {
+        self.steps.iter().any(|s| s.raise_unacknowledged)
+    }
+
+    /// Whether this ladder holds its noise back at `now`.
+    pub fn quiet_now(&self, now: Timestamp, night: &Night, tz: &TimeZone) -> bool {
+        self.quiet_at_night && night.contains(now, tz)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Night {
@@ -94,7 +107,7 @@ pub fn due(
         return None;
     }
 
-    if ladder.quiet_at_night && night.contains(now, tz) {
+    if ladder.quiet_now(now, night, tz) {
         // Deferred, not skipped: at night, only the very first notice ever
         // (no previous send at all) goes out at once — quietly, and as step
         // 0, standing in for the loud step its age would otherwise have
